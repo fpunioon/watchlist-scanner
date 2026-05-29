@@ -268,6 +268,7 @@ else:
         st.divider()
 
     # ── Cards premarket ───────────────────────────────────────────────────────
+    df["_pre_pct"] = pd.to_numeric(df.get("_pre_pct"), errors="coerce")
     if premarket:
         # Fetch premarket para todos
         infos = get_info_batch(WATCHLIST[:10])  # limitar para velocidad
@@ -281,7 +282,7 @@ else:
                 df.loc[i, "_pre_pct"] = pct
                 df.loc[i, "Premarket %"] = f"{pct:+.2f}%"
 
-        pre_movers = df[df["_pre_pct"].notna() & (df["_pre_pct"].abs() >= 1)]
+        pre_movers = df[df["_pre_pct"].notna() & (pd.to_numeric(df["_pre_pct"], errors="coerce").abs() >= 1)]
         if not pre_movers.empty:
             st.subheader("⏰ Movimiento premarket")
             cols2 = st.columns(min(len(pre_movers), 4))
