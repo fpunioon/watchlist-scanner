@@ -44,6 +44,9 @@ SIGNAL_LABELS = {
     "PULLBACK_BUY":   "🔄 Pullback EMA",
     "OVERSOLD":       "🏹 Oversold Bounce",
     "PREMARKET_MOVE": "⏰ Pre-mkt Move",
+    "RELATIVE_STRONG":"💪 Rel. Strength",
+    "VOL_SPIKE":      "🔥 Vol Spike",
+    "NEAR_52W":       "📌 Near 52w High",
 }
 
 # ── Hora CH ───────────────────────────────────────────────────────────────────
@@ -70,7 +73,7 @@ st.markdown(f'<div style="background:{bcol};padding:8px 16px;border-radius:8px;'
             f'</div>', unsafe_allow_html=True)
 
 c1, c2, c3 = st.columns([2, 1, 1])
-with c1: min_score = st.slider("Score mínimo para alertas", 20, 80, 40, 5)
+with c1: min_score = st.slider("Score mínimo para alertas", 10, 80, 20, 5)
 with c2: auto      = st.checkbox("Auto-refresh 5min", value=market_open or premarket)
 with c3: st.button("🔄 Actualizar", use_container_width=True)
 
@@ -180,6 +183,7 @@ def analyze_ticker(ticker, raw60, raw1y, info):
         "trend": "-",
         "dia_pct": None,
         "atr_val": None,
+        "rel_str": None,
     }
 
     try:
@@ -220,6 +224,18 @@ def analyze_ticker(ticker, raw60, raw1y, info):
         result["vol_z"]   = round(vol_z, 2)
         result["atr_val"] = round(atr_val, 2)
 
+        # ── Fuerza relativa vs QQQ (calculada aquí para poder usarla abajo) ──
+        qqq_pct = 0.0
+        try:
+            if "QQQ" in raw60.columns.get_level_values(0):
+                dq = raw60["QQQ"].dropna()
+                if len(dq) >= 2:
+                    qqq_pct = float((dq["Close"].iloc[-1] - dq["Close"].iloc[-2]) / dq["Close"].iloc[-2] * 100)
+        except Exception:
+            pass
+        rel_strength = round((result["dia_pct"] or 0) - qqq_pct, 2)
+        result["rel_str"] = rel_strength
+
         # ── 52w distancia ─────────────────────────────────────────────────────
         high52 = None
         if ticker in raw1y.columns.get_level_values(0):
@@ -253,75 +269,87 @@ def analyze_ticker(ticker, raw60, raw1y, info):
         pre_vol   = info.get("preMarketVolume") or 0
         vol_ratio = round(pre_vol / avg_vol, 2) if avg_vol > 0 else 0
 
+        # ── Pendiente EMA50 ───────────────────────────────────────────────────
+        ema50_slope = 0.0
+        if len(ema50_s) >= 5:
+            ema50_slope = float((ema50_s.iloc[-1] - ema50_s.iloc[-5]) / ema50_s.iloc[-5] * 100)
+
+        prev_rsi = float(rsi14.iloc[-2]) if len(rsi14) >= 2 else rsi_val
+        in_uptrend = ema50 > float(ema50_s.iloc[-10]) if len(ema50_s) >= 10 else False
+        near_ema9  = abs(price - ema9)  / ema9  < 0.015
+        near_ema21 = abs(price - ema21) / ema21 < 0.025
+
         # ═════════════════════════════════════════════════════════════════════
-        # MOTOR DE SEÑALES
+        # MOTOR DE SEÑALES — funciona en mercados alcistas Y bajistas
         # ═════════════════════════════════════════════════════════════════════
-        score    = 0
-        signals  = []
+        score   = 0
+        signals = []
 
         # ── 1. BREAKOUT 52w ───────────────────────────────────────────────────
-        # Precio rompe máximo anual + volumen alto + RSI en zona sana
-        if (result["dist52"] is not None and result["dist52"] >= -2
-                and vol_z >= 1.0 and 50 <= rsi_val <= 80 and macd_bull):
-            s = 45
-            s += min(10, int(vol_z * 3))              # más volumen = más score
-            s += 5 if result["dist52"] >= -0.5 else 0  # tocando máximo
+        if (result["dist52"] is not None and result["dist52"] >= -3
+                and vol_z >= 0.8 and 45 <= rsi_val <= 82 and macd_bull):
+            s = 40 + min(10, int(vol_z * 3))
+            s += 5 if result["dist52"] >= -1 else 0
             score += s
             signals.append("BREAKOUT")
 
-        # ── 2. MOMENTUM fuerte ────────────────────────────────────────────────
-        # Todas las EMAs alineadas + RSI zona momentum + volumen anormal
+        # ── 2. MOMENTUM ──────────────────────────────────────────────────────
         if (result["trend"] in ("↑↑↑", "↑↑")
-                and 55 <= rsi_val <= 75
-                and vol_z >= 0.5
+                and 50 <= rsi_val <= 78
                 and macd_bull
-                and result["dia_pct"] and result["dia_pct"] >= 1.5):
-            s = 35
+                and result["dia_pct"] and result["dia_pct"] >= 1.0):
+            s = 30
             s += 10 if result["trend"] == "↑↑↑" else 0
-            s += 5 if vol_z >= 1.5 else 0
+            s += 5  if vol_z >= 1.0 else 0
+            s += 5  if rel_strength > 2 else 0
             score += s
             signals.append("MOMENTUM")
 
-        # ── 3. GAP RALLY ──────────────────────────────────────────────────────
-        # Gap alcista premarket + volumen + RSI no sobrecomprado
-        if (result["pre_pct"] and result["pre_pct"] >= 2.0
-                and rsi_val < 75
-                and (vol_ratio >= 0.2 or vol_z >= 0.5)):
-            s = 30
-            s += min(15, int(result["pre_pct"] * 2))
+        # ── 3. GAP RALLY premarket ────────────────────────────────────────────
+        if (result["pre_pct"] and result["pre_pct"] >= 1.5 and rsi_val < 78):
+            s = 25 + min(20, int(abs(result["pre_pct"]) * 3))
             s += 5 if result["trend"] in ("↑↑↑", "↑↑") else 0
             score += s
             signals.append("GAP_RALLY")
 
-        # ── 4. PULLBACK A EMA (buy the dip en uptrend) ───────────────────────
-        # Uptrend largo pero precio retrocede a EMA9/21 + RSI 40-60 + vol bajo
-        in_uptrend  = ema50 > float(ema50_s.iloc[-10]) if len(ema50_s) >= 10 else False
-        near_ema9   = abs(price - ema9) / ema9 < 0.015
-        near_ema21  = abs(price - ema21) / ema21 < 0.02
-        if (in_uptrend and (near_ema9 or near_ema21)
-                and 38 <= rsi_val <= 58 and vol_z < 0.5):
-            s = 25
-            s += 5 if near_ema9 else 0
-            s += 5 if in_uptrend else 0
+        # ── 4. PULLBACK A EMA (buy the dip) ──────────────────────────────────
+        if (in_uptrend and ema50_slope > 0
+                and (near_ema9 or near_ema21)
+                and 35 <= rsi_val <= 60):
+            s = 25 + (5 if near_ema9 else 0) + (5 if ema50_slope > 0.5 else 0)
             score += s
             signals.append("PULLBACK_BUY")
 
         # ── 5. OVERSOLD BOUNCE ────────────────────────────────────────────────
-        # RSI extremo + vela verde de reversión + vol alto
-        prev_rsi = float(rsi14.iloc[-2]) if len(rsi14) >= 2 else rsi_val
-        if (rsi_val < 35 and rsi_val > prev_rsi    # RSI girando al alza
-                and vol_z >= 1.0
-                and result["dia_pct"] and result["dia_pct"] > 0):
-            s = 30
-            s += 10 if rsi_val < 28 else 0
-            s += 5 if vol_z >= 2.0 else 0
+        if (rsi_val < 38 and rsi_val > prev_rsi and vol_z >= 0.8):
+            s = 25 + (10 if rsi_val < 28 else 0) + (5 if vol_z >= 1.5 else 0)
             score += s
             signals.append("OVERSOLD")
 
-        # ── 6. PREMARKET MOVE genérico ────────────────────────────────────────
-        if (result["pre_pct"] and abs(result["pre_pct"]) >= 1.5
-                and "GAP_RALLY" not in signals):
+        # ── 6. FUERZA RELATIVA (aguanta cuando el mercado cae) ────────────────
+        if (rel_strength >= 3 and result["dia_pct"] and result["dia_pct"] > 0
+                and qqq_pct < -0.5):
+            s = 20 + min(15, int(rel_strength * 2))
+            score += s
+            signals.append("RELATIVE_STRONG")
+
+        # ── 7. VOL SPIKE con movimiento (catalizador sin confirmar) ───────────
+        if (vol_z >= 2.0 and result["dia_pct"] and abs(result["dia_pct"]) >= 2
+                and "MOMENTUM" not in signals and "BREAKOUT" not in signals):
+            score += 20
+            signals.append("VOL_SPIKE")
+
+        # ── 8. CERCA DEL MÁXIMO ANUAL (resistencia → soporte potencial) ──────
+        if (result["dist52"] is not None and -5 <= result["dist52"] <= -1
+                and result["trend"] in ("↑↑↑", "↑↑", "↑")
+                and "BREAKOUT" not in signals):
             score += 15
+            signals.append("NEAR_52W")
+
+        # ── 9. PREMARKET MOVE genérico ────────────────────────────────────────
+        if (result["pre_pct"] and abs(result["pre_pct"]) >= 1.0
+                and "GAP_RALLY" not in signals):
+            score += 12
             signals.append("PREMARKET_MOVE")
 
         # ═════════════════════════════════════════════════════════════════════
