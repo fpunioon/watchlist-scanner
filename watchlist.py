@@ -1,7 +1,7 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
-import ta
+import numpy as np
 from datetime import datetime
 import pytz
 
@@ -15,20 +15,14 @@ st.set_page_config(page_title="Watchlist Scanner", layout="wide")
 st.title("Watchlist Scanner")
 
 WATCHLIST = [
-    # Originales
     "V", "LHX", "TSM", "NRG", "ARM", "RTX", "LLY", "SNOW", "XOM", "RHM.DE",
     "NVDA", "GOOG", "MSFT", "QQQ", "ETH-USD", "CCJ", "AMD", "SLV", "UEC",
     "UBER", "ACX.MC", "MU", "LITE", "CLS", "BOTZ",
     "GC=F", "LMT", "GD", "TSLA", "AMZN", "GS", "PANW", "JBL", "VOO", "SMCI", "ASML",
-    # Financieras
     "JPM", "BAC", "BRK-B",
-    # Salud / Biotech
     "ABBV", "JNJ", "MRNA",
-    # Semiconductores
     "AMAT", "MRVL", "AVGO",
-    # Europa
     "SAP", "NVO",
-    # Alta volatilidad intraday
     "MSTR", "COIN", "PLTR",
 ]
 
@@ -45,7 +39,7 @@ t_min = now_ch.hour * 60 + now_ch.minute
 def is_premarket(): return 9*60 <= t_min < 15*60+30
 def is_open():      return 15*60+30 <= t_min <= 22*60
 
-premarket = is_premarket()
+premarket   = is_premarket()
 market_open = is_open()
 
 # ── Estado mercado ────────────────────────────────────────────────────────────
@@ -85,17 +79,27 @@ st.caption(f"Actualizado: {now_ch.strftime('%H:%M:%S')}")
 
 @st.cache_data(ttl=290)
 def fetch_data():
-    # Datos diarios 5 días (cierre, apertura, volumen)
     raw5d = yf.download(WATCHLIST, period="5d", interval="1d",
                         progress=False, auto_adjust=True, group_by="ticker")
-    # Máximos 52 semanas
     raw1y = yf.download(WATCHLIST, period="1y", interval="1d",
                         progress=False, auto_adjust=True, group_by="ticker")
     return raw5d, raw1y
 
 
+@st.cache_data(ttl=120)
+def fetch_premarket_data():
+    """Fetch premarket info para todos los tickers."""
+    out = {}
+    for t in WATCHLIST:
+        try:
+            info = yf.Ticker(t).info
+            out[t] = info
+        except Exception:
+            out[t] = {}
+    return out
+
+
 def get_info_batch(tickers):
-    """Fetch info for top movers (premarket, news)."""
     out = {}
     for t in tickers:
         try:
@@ -120,7 +124,6 @@ def scan():
     raw5d, raw1y = fetch_data()
     results = []
 
-    # Top movers para buscar info individual
     for ticker in WATCHLIST:
         try:
             if ticker not in raw5d.columns.get_level_values(0):
@@ -133,14 +136,13 @@ def scan():
             curr_close = float(df5["Close"].iloc[-1])
             open_today = float(df5["Open"].iloc[-1])
 
-            dia_pct    = round((curr_close - prev_close) / prev_close * 100, 2)
-            open_pct   = round((curr_close - open_today) / open_today * 100, 2) if open_today else None
+            dia_pct  = round((curr_close - prev_close) / prev_close * 100, 2)
+            open_pct = round((curr_close - open_today) / open_today * 100, 2) if open_today else None
 
             vol_hoy  = float(df5["Volume"].iloc[-1])
             vol_avg  = float(df5["Volume"].rolling(5).mean().iloc[-1])
             vol_ratio = round(vol_hoy / vol_avg, 2) if vol_avg > 0 else 0
 
-            # 52w high
             max52 = None
             dist52 = None
             if ticker in raw1y.columns.get_level_values(0):
@@ -151,18 +153,17 @@ def scan():
 
             nombre = TICKER_NAMES.get(ticker, ticker)
             results.append({
-                "Ticker":    nombre,
-                "_ticker":   ticker,
-                "Precio":    round(curr_close, 2),
-                "Día %":     dia_pct,
+                "Ticker":       nombre,
+                "_ticker":      ticker,
+                "Precio":       round(curr_close, 2),
+                "Día %":        dia_pct,
                 "Desde open %": open_pct if open_pct is not None else "-",
                 "Premarket %":  "-",
-                "_pre_pct":  None,
-                "vs 52w max": f"{dist52:.1f}%" if dist52 is not None else "-",
-                "_dist52":   dist52,
-                "Vol ratio": vol_ratio,
-                "Noticia":   "-",
-                "RSI":       "-",
+                "_pre_pct":     None,
+                "vs 52w max":   f"{dist52:.1f}%" if dist52 is not None else "-",
+                "_dist52":      dist52,
+                "Vol ratio":    vol_ratio,
+                "Noticia":      "-",
             })
         except Exception:
             continue
@@ -173,49 +174,236 @@ def scan():
     return df_r.sort_values("Día %", ascending=False).reset_index(drop=True)
 
 
-# ── Estilos ──────────────────────────────────────────────────────────────────
+# ── Helpers HTML ──────────────────────────────────────────────────────────────
 
-def style_dia(v):
-    try:
-        v = float(v)
-        if v >= 5:    return "background:#0a7a0a;color:white;font-weight:bold"
-        elif v >= 2:  return "background:#1a9a1a;color:white"
-        elif v >= 0:  return "background:#2db82d;color:white"
-        elif v >= -2: return "background:#8a1a1a;color:white"
-        else:         return "background:#6b0a0a;color:white;font-weight:bold"
-    except: return ""
+def fmt_pct(v, decimals=2):
+    if isinstance(v, (int, float)) and not pd.isna(v):
+        return f"{v:+.{decimals}f}%"
+    return str(v)
 
-def style_pre(v):
-    if v == "-" or not v: return "color:#555"
-    try:
-        n = float(str(v).replace("%","").replace("+",""))
-        if n >= 2:    return "background:#1a5c1a;color:white;font-weight:bold"
-        elif n > 0:   return "background:#2d7a2d;color:white"
-        elif n <= -2: return "background:#5c1a1a;color:white"
-        elif n < 0:   return "background:#3a1a1a;color:#ff9999"
-    except: return ""
-    return ""
 
-def style_open(v):
-    if v == "-" or not v: return "color:#555"
+def cell_color(v, thresholds=((5,"#0a7a0a"),(2,"#1a9a1a"),(0,"#2db82d"),(-2,"#8a1a1a"))):
     try:
-        n = float(str(v).replace("%","").replace("+",""))
-        if n >= 2:    return "background:#1a9a1a;color:white"
-        elif n > 0:   return "background:#2db82d;color:white"
-        elif n <= -2: return "background:#6b0a0a;color:white"
-        elif n < 0:   return "background:#8a1a1a;color:white"
-    except: return ""
-    return ""
+        n = float(v)
+        for thr, bg in thresholds:
+            if n >= thr:
+                return bg, "white"
+        return "#6b0a0a", "white"
+    except:
+        return None, None
 
-def style_52w(v):
-    if v == "-" or not v: return "color:#555"
-    try:
-        n = float(str(v).replace("%",""))
-        if n >= -3:   return "background:#1a5c1a;color:white;font-weight:bold"  # cerca del máximo
-        elif n >= -10:return "color:#90ee90"
-        elif n <= -30:return "color:#ff9999"
-    except: return ""
-    return ""
+
+# ── TABLA PREMARKET ───────────────────────────────────────────────────────────
+
+def render_premarket_table():
+    """Tabla con todos los valores ordenados por movimiento premarket."""
+
+    st.subheader("🌅 Radar Premarket — Oportunidades antes de apertura USA")
+
+    with st.spinner("Cargando datos premarket..."):
+        infos = fetch_premarket_data()
+        raw5d, raw1y = fetch_data()
+
+    rows = []
+    for ticker in WATCHLIST:
+        try:
+            info = infos.get(ticker, {})
+            nombre = TICKER_NAMES.get(ticker, ticker)
+
+            # Precio premarket y cierre anterior
+            pre_price  = info.get("preMarketPrice")
+            prev_close = info.get("regularMarketPreviousClose")
+            curr_price = info.get("regularMarketPrice") or info.get("currentPrice")
+            mkt_cap    = info.get("marketCap")
+
+            pre_pct = None
+            pre_vol = info.get("preMarketVolume")
+
+            if pre_price and prev_close and prev_close > 0:
+                pre_pct = round((pre_price - prev_close) / prev_close * 100, 2)
+
+            # Día anterior %
+            day_pct = None
+            if curr_price and prev_close and prev_close > 0:
+                day_pct = round((curr_price - prev_close) / prev_close * 100, 2)
+
+            # Vol ratio (premarket vol vs avg diario)
+            avg_vol = info.get("averageVolume")
+            pre_vol_ratio = None
+            if pre_vol and avg_vol and avg_vol > 0:
+                pre_vol_ratio = round(pre_vol / avg_vol, 2)
+
+            # 52w high
+            high52 = info.get("fiftyTwoWeekHigh")
+            dist52 = None
+            if high52 and curr_price and high52 > 0:
+                dist52 = round((curr_price - high52) / high52 * 100, 1)
+
+            # Tendencia (últimos 5 días)
+            trend = "-"
+            if ticker in raw5d.columns.get_level_values(0):
+                df5 = raw5d[ticker].dropna()
+                if len(df5) >= 3:
+                    closes = df5["Close"].iloc[-3:].values
+                    if closes[-1] > closes[-2] > closes[-3]:
+                        trend = "↑↑↑"
+                    elif closes[-1] > closes[-2]:
+                        trend = "↑↑"
+                    elif closes[-1] < closes[-2] < closes[-3]:
+                        trend = "↓↓↓"
+                    elif closes[-1] < closes[-2]:
+                        trend = "↓↓"
+                    else:
+                        trend = "→"
+
+            # Score rally (0-100)
+            score = 0
+            score_detail = []
+            if pre_pct is not None:
+                if pre_pct >= 3:   score += 35; score_detail.append(f"Pre+{pre_pct:.1f}%")
+                elif pre_pct >= 1: score += 20; score_detail.append(f"Pre+{pre_pct:.1f}%")
+                elif pre_pct > 0:  score += 10; score_detail.append(f"Pre+{pre_pct:.1f}%")
+            if pre_vol_ratio and pre_vol_ratio >= 0.3:
+                score += 20; score_detail.append(f"Vol{pre_vol_ratio:.1f}x")
+            if dist52 is not None and dist52 >= -5:
+                score += 20; score_detail.append("Near52w")
+            if trend in ("↑↑↑", "↑↑"):
+                score += 15; score_detail.append("Trend↑")
+            if day_pct and day_pct >= 1:
+                score += 10; score_detail.append(f"Día+{day_pct:.1f}%")
+
+            rows.append({
+                "Ticker":       nombre,
+                "_ticker":      ticker,
+                "Pre $":        f"{pre_price:.2f}" if pre_price else "-",
+                "Pre %":        pre_pct,
+                "Cierre ant.":  f"{prev_close:.2f}" if prev_close else "-",
+                "Día ant. %":   day_pct,
+                "Pre Vol ratio":pre_vol_ratio,
+                "vs 52w max":   dist52,
+                "Tendencia":    trend,
+                "Score Rally":  score,
+                "_score_detail":"; ".join(score_detail),
+            })
+
+        except Exception:
+            continue
+
+    if not rows:
+        st.warning("Sin datos premarket disponibles.")
+        return
+
+    df_pm = pd.DataFrame(rows)
+    # Ordenar por Score Rally desc, luego Pre % desc
+    df_pm = df_pm.sort_values(["Score Rally", "Pre %"], ascending=[False, False]).reset_index(drop=True)
+
+    # ── Cards top 4 por score ─────────────────────────────────────────────────
+    top4 = df_pm[df_pm["Score Rally"] > 0].head(4)
+    if not top4.empty:
+        st.markdown("**🎯 Top candidatos al rally hoy:**")
+        cols = st.columns(min(len(top4), 4))
+        for idx, (_, row) in enumerate(top4.iterrows()):
+            pre_pct = row["Pre %"]
+            score   = row["Score Rally"]
+            color   = "#0a4a0a" if (pre_pct or 0) >= 0 else "#4a0a0a"
+            pre_str = f"{pre_pct:+.2f}%" if pre_pct is not None else "n/d"
+            score_color = "#7dff7d" if score >= 50 else "#ffd700" if score >= 30 else "#ff9999"
+            with cols[idx]:
+                st.markdown(f"""
+                    <div style="background:{color};padding:14px;border-radius:10px;text-align:center;border:1px solid #2a2a2a">
+                        <div style="color:white;font-size:1.2em;font-weight:bold">{row['Ticker']}</div>
+                        <div style="color:#7dff7d;font-size:1.6em;font-weight:bold">{pre_str}</div>
+                        <div style="color:{score_color};font-size:0.9em;font-weight:bold">Score: {score}/100</div>
+                        <div style="color:#aaa;font-size:0.7em;margin-top:4px">{row['_score_detail']}</div>
+                        <div style="color:#888;font-size:0.8em">{row['Tendencia']}</div>
+                    </div>
+                """, unsafe_allow_html=True)
+        st.divider()
+
+    # ── Tabla completa premarket ──────────────────────────────────────────────
+    cols_pm = ["Ticker", "Pre $", "Pre %", "Cierre ant.", "Día ant. %",
+               "Pre Vol ratio", "vs 52w max", "Tendencia", "Score Rally"]
+
+    header = "".join(
+        f'<th style="padding:6px 10px;text-align:left;border-bottom:1px solid #333;color:#aaa;white-space:nowrap">{c}</th>'
+        for c in cols_pm
+    )
+
+    rows_html = ""
+    for _, row in df_pm.iterrows():
+        cells = ""
+        for col in cols_pm:
+            val = row[col]
+            style = "padding:6px 10px;white-space:nowrap;"
+
+            if col == "Pre %":
+                if val is not None and not (isinstance(val, float) and np.isnan(val)):
+                    if val >= 3:    style += "background:#0a7a0a;color:white;font-weight:bold;border-radius:4px;"
+                    elif val >= 1:  style += "background:#1a9a1a;color:white;border-radius:4px;"
+                    elif val > 0:   style += "background:#2db82d;color:white;border-radius:4px;"
+                    elif val <= -3: style += "background:#6b0a0a;color:white;font-weight:bold;border-radius:4px;"
+                    elif val < 0:   style += "background:#8a1a1a;color:white;border-radius:4px;"
+                    val = f"{val:+.2f}%"
+                else:
+                    val = "-"
+
+            elif col == "Día ant. %":
+                if val is not None and not (isinstance(val, float) and np.isnan(val)):
+                    if val >= 2:    style += "color:#7dff7d;font-weight:bold;"
+                    elif val > 0:   style += "color:#2db82d;"
+                    elif val <= -2: style += "color:#ff6666;font-weight:bold;"
+                    elif val < 0:   style += "color:#ff9999;"
+                    val = f"{val:+.2f}%"
+                else:
+                    val = "-"
+
+            elif col == "Pre Vol ratio":
+                if val is not None and not (isinstance(val, float) and np.isnan(val)):
+                    if val >= 0.5:  style += "color:#ffd700;font-weight:bold;"
+                    elif val >= 0.2:style += "color:#90ee90;"
+                    val = f"{val:.2f}x"
+                else:
+                    val = "-"
+
+            elif col == "vs 52w max":
+                if val is not None and not (isinstance(val, float) and np.isnan(val)):
+                    if val >= -3:   style += "background:#0a7a0a;color:white;font-weight:bold;border-radius:4px;"
+                    elif val >= -10:style += "color:#90ee90;"
+                    elif val <= -30:style += "color:#ff6666;"
+                    else:           style += "color:#ff9999;"
+                    val = f"{val:.1f}%"
+                else:
+                    val = "-"
+
+            elif col == "Score Rally":
+                if isinstance(val, (int, float)) and val > 0:
+                    if val >= 60:   style += "background:#0a5a0a;color:#7dff7d;font-weight:bold;border-radius:4px;"
+                    elif val >= 40: style += "background:#3a3a0a;color:#ffd700;font-weight:bold;border-radius:4px;"
+                    elif val >= 20: style += "color:#ffd700;"
+                    val = f"{int(val)}"
+                else:
+                    val = "-"
+
+            elif col == "Tendencia":
+                if val == "↑↑↑":   style += "color:#7dff7d;font-weight:bold;"
+                elif val == "↑↑":  style += "color:#2db82d;"
+                elif val == "↓↓↓": style += "color:#ff6666;font-weight:bold;"
+                elif val == "↓↓":  style += "color:#ff9999;"
+                else:               style += "color:#888;"
+
+            cells += f'<td style="{style}">{val}</td>'
+        rows_html += f"<tr style='border-bottom:1px solid #1a1a1a'>{cells}</tr>"
+
+    table_html = f"""
+    <div style="overflow-x:auto;overflow-y:auto;max-height:600px;margin-top:8px">
+    <table style="border-collapse:collapse;width:100%;font-size:0.85em;">
+        <thead><tr style="position:sticky;top:0;background:#0e1117">{header}</tr></thead>
+        <tbody>{rows_html}</tbody>
+    </table>
+    </div>
+    """
+    st.markdown(table_html, unsafe_allow_html=True)
+    st.caption("Score Rally: premarket% + volumen premarket + cercanía 52w max + tendencia reciente · Actualiza cada 5min")
 
 
 # ── Render ───────────────────────────────────────────────────────────────────
@@ -226,7 +414,7 @@ with st.spinner("Escaneando..."):
 if df.empty:
     st.error("Sin datos.")
 else:
-    # ── Alerta sonora si hay movers ───────────────────────────────────────────
+    # ── Alerta sonora ─────────────────────────────────────────────────────────
     alertas = df[df["Día %"] >= min_change]
     if not alertas.empty and (market_open or premarket):
         st.markdown("""
@@ -245,13 +433,9 @@ else:
     # ── Cards ganadoras del día ───────────────────────────────────────────────
     if not alertas.empty:
         st.subheader(f"🚀 Subiendo ≥ {min_change}% hoy")
-
-        # Fetch noticias solo para top 4
-        top_tickers = alertas.head(4)["_ticker"].tolist()
         for i, row in alertas.head(4).iterrows():
             noticia = get_news(row["_ticker"])
             df.loc[i, "Noticia"] = noticia[:60] + "..." if len(noticia) > 60 else noticia
-
         alertas = df[df["Día %"] >= min_change]
         cols = st.columns(min(len(alertas), 4))
         for idx, (_, row) in enumerate(alertas.head(4).iterrows()):
@@ -267,11 +451,10 @@ else:
                 """, unsafe_allow_html=True)
         st.divider()
 
-    # ── Cards premarket ───────────────────────────────────────────────────────
+    # ── Cards premarket (horario premarket) ───────────────────────────────────
     df["_pre_pct"] = pd.to_numeric(df.get("_pre_pct"), errors="coerce")
     if premarket:
-        # Fetch premarket para todos
-        infos = get_info_batch(WATCHLIST[:10])  # limitar para velocidad
+        infos = get_info_batch(WATCHLIST[:10])
         for i, row in df.iterrows():
             t = row["_ticker"]
             info = infos.get(t, {})
@@ -300,35 +483,24 @@ else:
                     """, unsafe_allow_html=True)
             st.divider()
 
-    # ── Tabla completa ────────────────────────────────────────────────────────
+    # ── TABLA PREMARKET ───────────────────────────────────────────────────────
+    render_premarket_table()
+
+    st.divider()
+
+    # ── Tabla completa posiciones ─────────────────────────────────────────────
     st.subheader("Todas las posiciones")
 
-    def fmt_pct(v, decimals=2):
-        if isinstance(v, (int, float)) and not pd.isna(v):
-            return f"{v:+.{decimals}f}%"
-        return str(v)
-
-    def cell_color(v, thresholds=((5,"#0a7a0a"),(2,"#1a9a1a"),(0,"#2db82d"),(-2,"#8a1a1a"))):
-        """Return (bg, fg) tuple."""
-        try:
-            n = float(v)
-            for thr, bg in thresholds:
-                if n >= thr:
-                    return bg, "white"
-            return "#6b0a0a", "white"
-        except:
-            return None, None
-
     display = df.drop(columns=["_ticker", "_pre_pct", "_dist52"], errors="ignore").copy()
-
-    # Pre-formatear columnas numéricas como strings con color via HTML
-    # Usamos st.markdown con tabla HTML para control total
-    rows_html = ""
     cols_order = ["Ticker", "Precio", "Día %", "Desde open %", "Premarket %", "vs 52w max", "Vol ratio", "Noticia"]
     cols_order = [c for c in cols_order if c in display.columns]
 
-    header = "".join(f'<th style="padding:6px 10px;text-align:left;border-bottom:1px solid #333;color:#aaa">{c}</th>' for c in cols_order)
+    header = "".join(
+        f'<th style="padding:6px 10px;text-align:left;border-bottom:1px solid #333;color:#aaa">{c}</th>'
+        for c in cols_order
+    )
 
+    rows_html = ""
     for _, row in display.iterrows():
         cells = ""
         for col in cols_order:
