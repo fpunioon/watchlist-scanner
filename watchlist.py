@@ -639,7 +639,7 @@ with tab3:
 
         cells = (
             f'<td style="padding:6px 10px;font-weight:bold;color:white">{row["nombre"]}</td>'
-            f'<td style="padding:6px 10px;color:#ccc">${row["price"]:.2f if row["price"] else "-"}</td>'
+            f'<td style="padding:6px 10px;color:#ccc">${round(row["price"],2) if row["price"] else "-"}</td>'
             f'<td style="padding:6px 10px">{pct_cell(row["dia_pct"], bold=True)}</td>'
             f'<td style="padding:6px 10px">{pct_cell(row["pre_pct"])}</td>'
             f'<td style="padding:6px 10px">{score_bar(row["score"])}</td>'
