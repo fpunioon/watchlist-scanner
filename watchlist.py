@@ -1,9 +1,17 @@
+"""
+Watchlist Scanner — Quant Engine v2
+Señales institucionales: Breakout, Momentum, Gap Rally, Pullback, Oversold Bounce
+Calcula automáticamente Entry / Stop / Target / R:R por cada ticker
+"""
+
 import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
 from datetime import datetime
 import pytz
+import warnings
+warnings.filterwarnings("ignore")
 
 try:
     from streamlit_autorefresh import st_autorefresh
@@ -12,547 +20,647 @@ except ImportError:
     HAS_AUTOREFRESH = False
 
 st.set_page_config(page_title="Watchlist Scanner", layout="wide")
-st.title("Watchlist Scanner")
 
+# ── Constantes ────────────────────────────────────────────────────────────────
 WATCHLIST = [
-    "V", "LHX", "TSM", "NRG", "ARM", "RTX", "LLY", "SNOW", "XOM", "RHM.DE",
-    "NVDA", "GOOG", "MSFT", "QQQ", "ETH-USD", "CCJ", "AMD", "SLV", "UEC",
-    "UBER", "ACX.MC", "MU", "LITE", "CLS", "BOTZ",
-    "GC=F", "LMT", "GD", "TSLA", "AMZN", "GS", "PANW", "JBL", "VOO", "SMCI", "ASML",
-    "JPM", "BAC", "BRK-B",
-    "ABBV", "JNJ", "MRNA",
-    "AMAT", "MRVL", "AVGO",
-    "SAP", "NVO",
-    "MSTR", "COIN", "PLTR",
+    "V", "LHX", "TSM", "NRG", "ARM", "RTX", "LLY", "SNOW", "XOM",
+    "NVDA", "GOOG", "MSFT", "QQQ", "AMD", "SLV", "UEC",
+    "UBER", "MU", "LITE", "CLS", "BOTZ",
+    "GC=F", "LMT", "GD", "TSLA", "AMZN", "GS", "PANW", "JBL", "VOO",
+    "SMCI", "ASML", "JPM", "BAC", "BRK-B",
+    "ABBV", "JNJ", "MRNA", "AMAT", "MRVL", "AVGO",
+    "SAP", "NVO", "MSTR", "COIN", "PLTR", "ETH-USD",
 ]
 
 TICKER_NAMES = {
-    "RHM.DE": "Rheinmetall", "ETH-USD": "Ethereum",
-    "ACX.MC": "Acerinox", "GC=F": "Gold Futures", "MU": "Micron",
+    "ETH-USD": "Ethereum", "GC=F": "Gold",
+    "MU": "Micron", "BRK-B": "Berkshire",
 }
 
-# ── Hora suiza ────────────────────────────────────────────────────────────────
-ch_tz = pytz.timezone("Europe/Zurich")
-now_ch = datetime.now(ch_tz)
-t_min = now_ch.hour * 60 + now_ch.minute
+SIGNAL_LABELS = {
+    "BREAKOUT":       "🚀 Breakout 52w",
+    "MOMENTUM":       "⚡ Momentum",
+    "GAP_RALLY":      "📈 Gap Rally",
+    "PULLBACK_BUY":   "🔄 Pullback EMA",
+    "OVERSOLD":       "🏹 Oversold Bounce",
+    "PREMARKET_MOVE": "⏰ Pre-mkt Move",
+}
 
-def is_premarket(): return 9*60 <= t_min < 15*60+30
-def is_open():      return 15*60+30 <= t_min <= 22*60
+# ── Hora CH ───────────────────────────────────────────────────────────────────
+ch_tz      = pytz.timezone("Europe/Zurich")
+now_ch     = datetime.now(ch_tz)
+t_min      = now_ch.hour * 60 + now_ch.minute
+premarket  = 9*60 <= t_min < 15*60+30
+market_open = 15*60+30 <= t_min <= 22*60
 
-premarket   = is_premarket()
-market_open = is_open()
-
-# ── Estado mercado ────────────────────────────────────────────────────────────
+# ── Header ───────────────────────────────────────────────────────────────────
+st.title("Watchlist Scanner")
 if premarket:
-    mins_left = (15*60+30) - t_min
-    estado = f"⏰ PREMARKET — Apertura en {mins_left} min"
-    estado_color = "#a85a00"
+    mins = (15*60+30) - t_min
+    badge = f"⏰ PREMARKET — Apertura en {mins} min"
+    bcol  = "#a85a00"
 elif market_open:
-    estado = "🟢 MERCADO ABIERTO"
-    estado_color = "#1a7a1a"
+    badge, bcol = "🟢 MERCADO ABIERTO", "#1a7a1a"
 else:
-    estado = "🔴 MERCADO CERRADO"
-    estado_color = "#5c1a1a"
+    badge, bcol = "🔴 MERCADO CERRADO", "#5c1a1a"
 
-st.markdown(f"""
-    <div style="background:{estado_color};padding:8px 16px;border-radius:8px;display:inline-block;margin-bottom:8px">
-        <span style="color:white;font-weight:bold">{estado} · {now_ch.strftime('%H:%M')} CH</span>
-    </div>
-""", unsafe_allow_html=True)
+st.markdown(f'<div style="background:{bcol};padding:8px 16px;border-radius:8px;'
+            f'display:inline-block;margin-bottom:8px">'
+            f'<span style="color:white;font-weight:bold">{badge} · {now_ch.strftime("%H:%M")} CH</span>'
+            f'</div>', unsafe_allow_html=True)
 
-# ── Controles ────────────────────────────────────────────────────────────────
 c1, c2, c3 = st.columns([2, 1, 1])
-with c1:
-    min_change = st.slider("Alerta a partir de %", 0.0, 10.0, 2.0, 0.5)
-with c2:
-    auto = st.checkbox("Auto-refresh 5min", value=market_open or premarket)
-with c3:
-    st.button("🔄 Actualizar", use_container_width=True)
+with c1: min_score = st.slider("Score mínimo para alertas", 20, 80, 40, 5)
+with c2: auto      = st.checkbox("Auto-refresh 5min", value=market_open or premarket)
+with c3: st.button("🔄 Actualizar", use_container_width=True)
 
 if auto and HAS_AUTOREFRESH:
-    st_autorefresh(interval=5 * 60 * 1000, key="auto")
-
+    st_autorefresh(interval=5*60*1000, key="auto")
 st.caption(f"Actualizado: {now_ch.strftime('%H:%M:%S')}")
 
 
-# ── Datos ─────────────────────────────────────────────────────────────────────
+# ── Fetch ─────────────────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=290)
-def fetch_data():
-    raw5d = yf.download(WATCHLIST, period="5d", interval="1d",
-                        progress=False, auto_adjust=True, group_by="ticker")
-    raw1y = yf.download(WATCHLIST, period="1y", interval="1d",
-                        progress=False, auto_adjust=True, group_by="ticker")
-    return raw5d, raw1y
+def fetch_ohlcv():
+    """60 días diarios — suficiente para todos los indicadores."""
+    df = yf.download(WATCHLIST, period="60d", interval="1d",
+                     progress=False, auto_adjust=True, group_by="ticker")
+    return df
 
+@st.cache_data(ttl=290)
+def fetch_52w():
+    df = yf.download(WATCHLIST, period="1y", interval="1d",
+                     progress=False, auto_adjust=True, group_by="ticker")
+    return df
 
 @st.cache_data(ttl=120)
-def fetch_premarket_data():
-    """Fetch premarket info para todos los tickers."""
+def fetch_info_all():
     out = {}
     for t in WATCHLIST:
         try:
-            info = yf.Ticker(t).info
-            out[t] = info
+            out[t] = yf.Ticker(t).info
         except Exception:
             out[t] = {}
     return out
 
-
-def get_info_batch(tickers):
+@st.cache_data(ttl=120)
+def fetch_news_bulk():
     out = {}
-    for t in tickers:
+    for t in WATCHLIST:
         try:
-            info = yf.Ticker(t).info
-            out[t] = info
+            news = yf.Ticker(t).news
+            if news:
+                title = news[0].get("content", {}).get("title", "") or news[0].get("title", "")
+                out[t] = title[:70] + ("..." if len(title) > 70 else "")
+            else:
+                out[t] = "-"
         except Exception:
-            out[t] = {}
+            out[t] = "-"
     return out
 
 
-def get_news(ticker):
+# ── Indicadores ──────────────────────────────────────────────────────────────
+
+def ema(series, n):
+    return series.ewm(span=n, adjust=False).mean()
+
+def rsi(series, n=14):
+    delta  = series.diff()
+    gain   = delta.clip(lower=0).rolling(n).mean()
+    loss   = (-delta.clip(upper=0)).rolling(n).mean()
+    rs     = gain / loss.replace(0, np.nan)
+    return 100 - 100 / (1 + rs)
+
+def atr(high, low, close, n=14):
+    tr = pd.concat([
+        high - low,
+        (high - close.shift()).abs(),
+        (low  - close.shift()).abs(),
+    ], axis=1).max(axis=1)
+    return tr.rolling(n).mean()
+
+def macd_signal(close):
+    """Returns True if MACD line > signal line."""
+    m = ema(close, 12) - ema(close, 26)
+    s = ema(m, 9)
+    return (m.iloc[-1] > s.iloc[-1]), float(m.iloc[-1] - s.iloc[-1])
+
+def vol_zscore(vol_series):
+    """Z-score del volumen hoy vs últimos 20 días."""
+    if len(vol_series) < 5:
+        return 0.0
+    hist  = vol_series.iloc[:-1].tail(20)
+    mu    = hist.mean()
+    sigma = hist.std()
+    if sigma == 0:
+        return 0.0
+    return float((vol_series.iloc[-1] - mu) / sigma)
+
+
+# ── Motor de señales ──────────────────────────────────────────────────────────
+
+def analyze_ticker(ticker, raw60, raw1y, info):
+    """
+    Devuelve dict con score, señales, entry, stop, target, indicadores.
+    """
+    result = {
+        "ticker": ticker,
+        "nombre": TICKER_NAMES.get(ticker, ticker),
+        "score":  0,
+        "signals": [],
+        "entry": None, "stop": None,
+        "target1": None, "target2": None,
+        "rr": None,
+        "price": None,
+        "pre_pct": None,
+        "rsi_val": None,
+        "vol_z": None,
+        "dist52": None,
+        "trend": "-",
+        "dia_pct": None,
+        "atr_val": None,
+    }
+
     try:
-        news = yf.Ticker(ticker).news
-        if news:
-            return news[0].get("content", {}).get("title", "") or news[0].get("title", "")
-    except Exception:
+        if ticker not in raw60.columns.get_level_values(0):
+            return result
+        df = raw60[ticker].dropna()
+        if len(df) < 20:
+            return result
+
+        close  = df["Close"].astype(float)
+        high   = df["High"].astype(float)
+        low    = df["Low"].astype(float)
+        volume = df["Volume"].astype(float)
+
+        price      = float(close.iloc[-1])
+        prev_close = float(close.iloc[-2])
+        open_today = float(df["Open"].iloc[-1])
+
+        result["price"]   = price
+        result["dia_pct"] = round((price - prev_close) / prev_close * 100, 2)
+
+        # ── Indicadores ──────────────────────────────────────────────────────
+        rsi14    = rsi(close, 14)
+        ema9_s   = ema(close, 9)
+        ema21_s  = ema(close, 21)
+        ema50_s  = ema(close, 50)
+        atr14    = atr(high, low, close, 14)
+        vol_z    = vol_zscore(volume)
+        macd_bull, macd_diff = macd_signal(close)
+
+        rsi_val  = float(rsi14.iloc[-1])
+        ema9     = float(ema9_s.iloc[-1])
+        ema21    = float(ema21_s.iloc[-1])
+        ema50    = float(ema50_s.iloc[-1])
+        atr_val  = float(atr14.iloc[-1]) if not pd.isna(atr14.iloc[-1]) else price * 0.02
+
+        result["rsi_val"] = round(rsi_val, 1)
+        result["vol_z"]   = round(vol_z, 2)
+        result["atr_val"] = round(atr_val, 2)
+
+        # ── 52w distancia ─────────────────────────────────────────────────────
+        high52 = None
+        if ticker in raw1y.columns.get_level_values(0):
+            df1y = raw1y[ticker].dropna()
+            if not df1y.empty and "High" in df1y.columns:
+                high52 = float(df1y["High"].astype(float).max())
+        if high52 and high52 > 0:
+            result["dist52"] = round((price - high52) / high52 * 100, 1)
+
+        # ── Tendencia (alineación EMAs) ───────────────────────────────────────
+        if price > ema9 > ema21 > ema50:
+            result["trend"] = "↑↑↑"
+        elif price > ema9 > ema21:
+            result["trend"] = "↑↑"
+        elif price > ema9:
+            result["trend"] = "↑"
+        elif price < ema9 < ema21 < ema50:
+            result["trend"] = "↓↓↓"
+        elif price < ema9 < ema21:
+            result["trend"] = "↓↓"
+        else:
+            result["trend"] = "→"
+
+        # ── Premarket ─────────────────────────────────────────────────────────
+        pre_price = info.get("preMarketPrice")
+        if pre_price and prev_close and prev_close > 0:
+            result["pre_pct"] = round((pre_price - prev_close) / prev_close * 100, 2)
+
+        # ── Vol ratio (premarket) ─────────────────────────────────────────────
+        avg_vol   = info.get("averageVolume") or 0
+        pre_vol   = info.get("preMarketVolume") or 0
+        vol_ratio = round(pre_vol / avg_vol, 2) if avg_vol > 0 else 0
+
+        # ═════════════════════════════════════════════════════════════════════
+        # MOTOR DE SEÑALES
+        # ═════════════════════════════════════════════════════════════════════
+        score    = 0
+        signals  = []
+
+        # ── 1. BREAKOUT 52w ───────────────────────────────────────────────────
+        # Precio rompe máximo anual + volumen alto + RSI en zona sana
+        if (result["dist52"] is not None and result["dist52"] >= -2
+                and vol_z >= 1.0 and 50 <= rsi_val <= 80 and macd_bull):
+            s = 45
+            s += min(10, int(vol_z * 3))              # más volumen = más score
+            s += 5 if result["dist52"] >= -0.5 else 0  # tocando máximo
+            score += s
+            signals.append("BREAKOUT")
+
+        # ── 2. MOMENTUM fuerte ────────────────────────────────────────────────
+        # Todas las EMAs alineadas + RSI zona momentum + volumen anormal
+        if (result["trend"] in ("↑↑↑", "↑↑")
+                and 55 <= rsi_val <= 75
+                and vol_z >= 0.5
+                and macd_bull
+                and result["dia_pct"] and result["dia_pct"] >= 1.5):
+            s = 35
+            s += 10 if result["trend"] == "↑↑↑" else 0
+            s += 5 if vol_z >= 1.5 else 0
+            score += s
+            signals.append("MOMENTUM")
+
+        # ── 3. GAP RALLY ──────────────────────────────────────────────────────
+        # Gap alcista premarket + volumen + RSI no sobrecomprado
+        if (result["pre_pct"] and result["pre_pct"] >= 2.0
+                and rsi_val < 75
+                and (vol_ratio >= 0.2 or vol_z >= 0.5)):
+            s = 30
+            s += min(15, int(result["pre_pct"] * 2))
+            s += 5 if result["trend"] in ("↑↑↑", "↑↑") else 0
+            score += s
+            signals.append("GAP_RALLY")
+
+        # ── 4. PULLBACK A EMA (buy the dip en uptrend) ───────────────────────
+        # Uptrend largo pero precio retrocede a EMA9/21 + RSI 40-60 + vol bajo
+        in_uptrend  = ema50 > float(ema50_s.iloc[-10]) if len(ema50_s) >= 10 else False
+        near_ema9   = abs(price - ema9) / ema9 < 0.015
+        near_ema21  = abs(price - ema21) / ema21 < 0.02
+        if (in_uptrend and (near_ema9 or near_ema21)
+                and 38 <= rsi_val <= 58 and vol_z < 0.5):
+            s = 25
+            s += 5 if near_ema9 else 0
+            s += 5 if in_uptrend else 0
+            score += s
+            signals.append("PULLBACK_BUY")
+
+        # ── 5. OVERSOLD BOUNCE ────────────────────────────────────────────────
+        # RSI extremo + vela verde de reversión + vol alto
+        prev_rsi = float(rsi14.iloc[-2]) if len(rsi14) >= 2 else rsi_val
+        if (rsi_val < 35 and rsi_val > prev_rsi    # RSI girando al alza
+                and vol_z >= 1.0
+                and result["dia_pct"] and result["dia_pct"] > 0):
+            s = 30
+            s += 10 if rsi_val < 28 else 0
+            s += 5 if vol_z >= 2.0 else 0
+            score += s
+            signals.append("OVERSOLD")
+
+        # ── 6. PREMARKET MOVE genérico ────────────────────────────────────────
+        if (result["pre_pct"] and abs(result["pre_pct"]) >= 1.5
+                and "GAP_RALLY" not in signals):
+            score += 15
+            signals.append("PREMARKET_MOVE")
+
+        # ═════════════════════════════════════════════════════════════════════
+        # NIVELES DE ENTRADA / STOP / TARGET (basados en ATR)
+        # ═════════════════════════════════════════════════════════════════════
+        if score >= 20 and signals:
+            entry = pre_price if (pre_price and result["pre_pct"] and result["pre_pct"] > 0) else price
+
+            # Stop: 1.5 ATR por debajo de entrada
+            stop    = round(entry - 1.5 * atr_val, 2)
+            # Target1: 2x ATR (R:R 1.33)
+            target1 = round(entry + 2.0 * atr_val, 2)
+            # Target2: 3.5x ATR (R:R 2.33)
+            target2 = round(entry + 3.5 * atr_val, 2)
+            rr      = round((target1 - entry) / (entry - stop), 2) if entry > stop else 0
+
+            result["entry"]   = round(entry, 2)
+            result["stop"]    = stop
+            result["target1"] = target1
+            result["target2"] = target2
+            result["rr"]      = rr
+
+        result["score"]   = min(score, 100)
+        result["signals"] = signals
+
+    except Exception as e:
         pass
-    return "-"
+
+    return result
 
 
-def scan():
-    raw5d, raw1y = fetch_data()
-    results = []
+# ── Render helpers ────────────────────────────────────────────────────────────
 
-    for ticker in WATCHLIST:
-        try:
-            if ticker not in raw5d.columns.get_level_values(0):
-                continue
-            df5 = raw5d[ticker].dropna()
-            if df5.empty or len(df5) < 2:
-                continue
+def score_bar(score):
+    if score >= 70:   color = "#0a7a0a"
+    elif score >= 50: color = "#7a7a0a"
+    elif score >= 30: color = "#7a4a0a"
+    else:             color = "#3a3a3a"
+    return (f'<div style="background:#1a1a1a;border-radius:4px;height:8px;width:80px;display:inline-block">'
+            f'<div style="background:{color};width:{score}%;height:8px;border-radius:4px"></div></div> '
+            f'<span style="color:white;font-weight:bold">{score}</span>')
 
-            prev_close = float(df5["Close"].iloc[-2])
-            curr_close = float(df5["Close"].iloc[-1])
-            open_today = float(df5["Open"].iloc[-1])
+def rating(score):
+    if score >= 70: return '<span style="color:#7dff7d;font-weight:bold">STRONG BUY</span>'
+    if score >= 50: return '<span style="color:#2db82d">BUY</span>'
+    if score >= 35: return '<span style="color:#ffd700">WATCH</span>'
+    return '<span style="color:#888">-</span>'
 
-            dia_pct  = round((curr_close - prev_close) / prev_close * 100, 2)
-            open_pct = round((curr_close - open_today) / open_today * 100, 2) if open_today else None
+def pct_cell(v, bold=False):
+    if v is None: return "-"
+    fw = "font-weight:bold;" if bold else ""
+    if v >= 3:    return f'<span style="color:#7dff7d;{fw}">{v:+.2f}%</span>'
+    if v >= 1:    return f'<span style="color:#2db82d;{fw}">{v:+.2f}%</span>'
+    if v > 0:     return f'<span style="color:#90ee90;{fw}">{v:+.2f}%</span>'
+    if v >= -1:   return f'<span style="color:#ff9999;{fw}">{v:+.2f}%</span>'
+    return f'<span style="color:#ff6666;{fw}">{v:+.2f}%</span>'
 
-            vol_hoy  = float(df5["Volume"].iloc[-1])
-            vol_avg  = float(df5["Volume"].rolling(5).mean().iloc[-1])
-            vol_ratio = round(vol_hoy / vol_avg, 2) if vol_avg > 0 else 0
+def rsi_cell(v):
+    if v is None: return "-"
+    if v >= 75:   return f'<span style="color:#ff9999">{v:.0f} ⚠️</span>'
+    if v >= 60:   return f'<span style="color:#7dff7d">{v:.0f}</span>'
+    if v >= 45:   return f'<span style="color:#90ee90">{v:.0f}</span>'
+    if v <= 30:   return f'<span style="color:#ff6666;font-weight:bold">{v:.0f} 🏹</span>'
+    return f'<span style="color:#aaa">{v:.0f}</span>'
 
-            max52 = None
-            dist52 = None
-            if ticker in raw1y.columns.get_level_values(0):
-                df1y = raw1y[ticker].dropna()
-                if not df1y.empty and "High" in df1y.columns:
-                    max52 = float(df1y["High"].max())
-                    dist52 = round((curr_close - max52) / max52 * 100, 1)
+def volz_cell(v):
+    if v is None: return "-"
+    if v >= 2.0:  return f'<span style="color:#ffd700;font-weight:bold">{v:.1f}σ 🔥</span>'
+    if v >= 1.0:  return f'<span style="color:#ffd700">{v:.1f}σ</span>'
+    if v >= 0.0:  return f'<span style="color:#888">{v:.1f}σ</span>'
+    return f'<span style="color:#555">{v:.1f}σ</span>'
 
-            nombre = TICKER_NAMES.get(ticker, ticker)
-            results.append({
-                "Ticker":       nombre,
-                "_ticker":      ticker,
-                "Precio":       round(curr_close, 2),
-                "Día %":        dia_pct,
-                "Desde open %": open_pct if open_pct is not None else "-",
-                "Premarket %":  "-",
-                "_pre_pct":     None,
-                "vs 52w max":   f"{dist52:.1f}%" if dist52 is not None else "-",
-                "_dist52":      dist52,
-                "Vol ratio":    vol_ratio,
-                "Noticia":      "-",
-            })
-        except Exception:
-            continue
-
-    df_r = pd.DataFrame(results)
-    if df_r.empty:
-        return df_r
-    return df_r.sort_values("Día %", ascending=False).reset_index(drop=True)
+def trend_cell(t):
+    m = {"↑↑↑": "#7dff7d", "↑↑": "#2db82d", "↑": "#90ee90",
+         "↓↓↓": "#ff6666", "↓↓": "#ff9999", "↓": "#ffaaaa", "→": "#888"}
+    c = m.get(t, "#888")
+    return f'<span style="color:{c};font-weight:bold">{t}</span>'
 
 
-# ── Helpers HTML ──────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════════════════════════════════════
 
-def fmt_pct(v, decimals=2):
-    if isinstance(v, (int, float)) and not pd.isna(v):
-        return f"{v:+.{decimals}f}%"
-    return str(v)
+with st.spinner("Analizando mercado..."):
+    raw60  = fetch_ohlcv()
+    raw1y  = fetch_52w()
+    infos  = fetch_info_all()
+    news   = fetch_news_bulk()
+
+# Analizar todos los tickers
+results = []
+for t in WATCHLIST:
+    r = analyze_ticker(t, raw60, raw1y, infos.get(t, {}))
+    r["noticia"] = news.get(t, "-")
+    results.append(r)
+
+df_all = pd.DataFrame(results)
+df_all = df_all.sort_values("score", ascending=False).reset_index(drop=True)
+
+# ── TAB layout ────────────────────────────────────────────────────────────────
+tab1, tab2, tab3 = st.tabs(["🎯 Oportunidades", "🌅 Radar Premarket", "📋 Todas las posiciones"])
 
 
-def cell_color(v, thresholds=((5,"#0a7a0a"),(2,"#1a9a1a"),(0,"#2db82d"),(-2,"#8a1a1a"))):
-    try:
-        n = float(v)
-        for thr, bg in thresholds:
-            if n >= thr:
-                return bg, "white"
-        return "#6b0a0a", "white"
-    except:
-        return None, None
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 1 — OPORTUNIDADES
+# ══════════════════════════════════════════════════════════════════════════════
+with tab1:
+    ops = df_all[df_all["score"] >= min_score].copy()
 
+    if ops.empty:
+        st.info(f"Sin oportunidades con score ≥ {min_score}. Baja el umbral o espera a premarket.")
+    else:
+        st.markdown(f"### {len(ops)} oportunidades detectadas")
 
-# ── TABLA PREMARKET ───────────────────────────────────────────────────────────
-
-def render_premarket_table():
-    """Tabla con todos los valores ordenados por movimiento premarket."""
-
-    st.subheader("🌅 Radar Premarket — Oportunidades antes de apertura USA")
-
-    with st.spinner("Cargando datos premarket..."):
-        infos = fetch_premarket_data()
-        raw5d, raw1y = fetch_data()
-
-    rows = []
-    for ticker in WATCHLIST:
-        try:
-            info = infos.get(ticker, {})
-            nombre = TICKER_NAMES.get(ticker, ticker)
-
-            # Precio premarket y cierre anterior
-            pre_price  = info.get("preMarketPrice")
-            prev_close = info.get("regularMarketPreviousClose")
-            curr_price = info.get("regularMarketPrice") or info.get("currentPrice")
-            mkt_cap    = info.get("marketCap")
-
-            pre_pct = None
-            pre_vol = info.get("preMarketVolume")
-
-            if pre_price and prev_close and prev_close > 0:
-                pre_pct = round((pre_price - prev_close) / prev_close * 100, 2)
-
-            # Día anterior %
-            day_pct = None
-            if curr_price and prev_close and prev_close > 0:
-                day_pct = round((curr_price - prev_close) / prev_close * 100, 2)
-
-            # Vol ratio (premarket vol vs avg diario)
-            avg_vol = info.get("averageVolume")
-            pre_vol_ratio = None
-            if pre_vol and avg_vol and avg_vol > 0:
-                pre_vol_ratio = round(pre_vol / avg_vol, 2)
-
-            # 52w high
-            high52 = info.get("fiftyTwoWeekHigh")
-            dist52 = None
-            if high52 and curr_price and high52 > 0:
-                dist52 = round((curr_price - high52) / high52 * 100, 1)
-
-            # Tendencia (últimos 5 días)
-            trend = "-"
-            if ticker in raw5d.columns.get_level_values(0):
-                df5 = raw5d[ticker].dropna()
-                if len(df5) >= 3:
-                    closes = df5["Close"].iloc[-3:].values
-                    if closes[-1] > closes[-2] > closes[-3]:
-                        trend = "↑↑↑"
-                    elif closes[-1] > closes[-2]:
-                        trend = "↑↑"
-                    elif closes[-1] < closes[-2] < closes[-3]:
-                        trend = "↓↓↓"
-                    elif closes[-1] < closes[-2]:
-                        trend = "↓↓"
-                    else:
-                        trend = "→"
-
-            # Score rally (0-100)
-            score = 0
-            score_detail = []
-            if pre_pct is not None:
-                if pre_pct >= 3:   score += 35; score_detail.append(f"Pre+{pre_pct:.1f}%")
-                elif pre_pct >= 1: score += 20; score_detail.append(f"Pre+{pre_pct:.1f}%")
-                elif pre_pct > 0:  score += 10; score_detail.append(f"Pre+{pre_pct:.1f}%")
-            if pre_vol_ratio and pre_vol_ratio >= 0.3:
-                score += 20; score_detail.append(f"Vol{pre_vol_ratio:.1f}x")
-            if dist52 is not None and dist52 >= -5:
-                score += 20; score_detail.append("Near52w")
-            if trend in ("↑↑↑", "↑↑"):
-                score += 15; score_detail.append("Trend↑")
-            if day_pct and day_pct >= 1:
-                score += 10; score_detail.append(f"Día+{day_pct:.1f}%")
-
-            rows.append({
-                "Ticker":       nombre,
-                "_ticker":      ticker,
-                "Pre $":        f"{pre_price:.2f}" if pre_price else "-",
-                "Pre %":        pre_pct,
-                "Cierre ant.":  f"{prev_close:.2f}" if prev_close else "-",
-                "Día ant. %":   day_pct,
-                "Pre Vol ratio":pre_vol_ratio,
-                "vs 52w max":   dist52,
-                "Tendencia":    trend,
-                "Score Rally":  score,
-                "_score_detail":"; ".join(score_detail),
-            })
-
-        except Exception:
-            continue
-
-    if not rows:
-        st.warning("Sin datos premarket disponibles.")
-        return
-
-    df_pm = pd.DataFrame(rows)
-    # Ordenar por Score Rally desc, luego Pre % desc
-    df_pm = df_pm.sort_values(["Score Rally", "Pre %"], ascending=[False, False]).reset_index(drop=True)
-
-    # ── Cards top 4 por score ─────────────────────────────────────────────────
-    top4 = df_pm[df_pm["Score Rally"] > 0].head(4)
-    if not top4.empty:
-        st.markdown("**🎯 Top candidatos al rally hoy:**")
-        cols = st.columns(min(len(top4), 4))
+        # Cards top 4
+        top4 = ops.head(4)
+        cols = st.columns(4)
         for idx, (_, row) in enumerate(top4.iterrows()):
-            pre_pct = row["Pre %"]
-            score   = row["Score Rally"]
-            color   = "#0a4a0a" if (pre_pct or 0) >= 0 else "#4a0a0a"
-            pre_str = f"{pre_pct:+.2f}%" if pre_pct is not None else "n/d"
-            score_color = "#7dff7d" if score >= 50 else "#ffd700" if score >= 30 else "#ff9999"
             with cols[idx]:
+                sigs  = " · ".join([SIGNAL_LABELS.get(s, s) for s in row["signals"]])
+                color = "#0a3a0a" if row["score"] >= 50 else "#3a3a0a"
+                pre_str = f"Pre: {row['pre_pct']:+.2f}%" if row["pre_pct"] else ""
+                entry_str = f"Entry: ${row['entry']}" if row["entry"] else ""
+                rr_str = f"R:R {row['rr']}:1" if row["rr"] else ""
+                price_disp = f"{row['price']:.2f}" if row["price"] else "-"
                 st.markdown(f"""
-                    <div style="background:{color};padding:14px;border-radius:10px;text-align:center;border:1px solid #2a2a2a">
-                        <div style="color:white;font-size:1.2em;font-weight:bold">{row['Ticker']}</div>
-                        <div style="color:#7dff7d;font-size:1.6em;font-weight:bold">{pre_str}</div>
-                        <div style="color:{score_color};font-size:0.9em;font-weight:bold">Score: {score}/100</div>
-                        <div style="color:#aaa;font-size:0.7em;margin-top:4px">{row['_score_detail']}</div>
-                        <div style="color:#888;font-size:0.8em">{row['Tendencia']}</div>
+                    <div style="background:{color};padding:14px;border-radius:10px;
+                                border:1px solid #2a5a2a;margin-bottom:8px">
+                        <div style="color:white;font-size:1.2em;font-weight:bold">{row['nombre']}</div>
+                        <div style="color:#7dff7d;font-size:1.4em;font-weight:bold">Score: {row['score']}</div>
+                        <div style="color:#ffd700;font-size:0.75em;margin:4px 0">{sigs}</div>
+                        <div style="color:#ccc;font-size:0.8em">${price_disp} · RSI {row['rsi_val'] or '-'}</div>
+                        <div style="color:#aaa;font-size:0.75em">{entry_str} · {rr_str}</div>
+                        <div style="color:#90ee90;font-size:0.7em">{pre_str}</div>
                     </div>
                 """, unsafe_allow_html=True)
+
         st.divider()
 
-    # ── Tabla completa premarket ──────────────────────────────────────────────
-    cols_pm = ["Ticker", "Pre $", "Pre %", "Cierre ant.", "Día ant. %",
-               "Pre Vol ratio", "vs 52w max", "Tendencia", "Score Rally"]
+        # Tabla detallada de oportunidades
+        st.markdown("#### Detalle de señales y niveles operativos")
 
-    header = "".join(
-        f'<th style="padding:6px 10px;text-align:left;border-bottom:1px solid #333;color:#aaa;white-space:nowrap">{c}</th>'
-        for c in cols_pm
-    )
+        COLS = ["Ticker", "Score", "Rating", "Señales", "Precio", "Pre %",
+                "Entry", "Stop", "T1", "T2", "R:R",
+                "RSI", "Vol σ", "Trend", "Noticia"]
 
-    rows_html = ""
-    for _, row in df_pm.iterrows():
-        cells = ""
-        for col in cols_pm:
-            val = row[col]
-            style = "padding:6px 10px;white-space:nowrap;"
+        header_html = "".join(
+            f'<th style="padding:7px 10px;text-align:left;border-bottom:2px solid #333;'
+            f'color:#aaa;white-space:nowrap;font-size:0.8em">{c}</th>'
+            for c in COLS
+        )
 
-            if col == "Pre %":
-                if val is not None and not (isinstance(val, float) and np.isnan(val)):
-                    if val >= 3:    style += "background:#0a7a0a;color:white;font-weight:bold;border-radius:4px;"
-                    elif val >= 1:  style += "background:#1a9a1a;color:white;border-radius:4px;"
-                    elif val > 0:   style += "background:#2db82d;color:white;border-radius:4px;"
-                    elif val <= -3: style += "background:#6b0a0a;color:white;font-weight:bold;border-radius:4px;"
-                    elif val < 0:   style += "background:#8a1a1a;color:white;border-radius:4px;"
-                    val = f"{val:+.2f}%"
-                else:
-                    val = "-"
+        rows_html = ""
+        for _, row in ops.iterrows():
+            sigs_html = " ".join([
+                f'<span style="background:#1a3a1a;color:#7dff7d;padding:1px 5px;'
+                f'border-radius:3px;font-size:0.7em">{SIGNAL_LABELS.get(s,s)}</span>'
+                for s in row["signals"]
+            ])
+            price_str  = f"${row['price']:.2f}"  if row["price"]   else "-"
+            entry_str  = f"${row['entry']:.2f}"  if row["entry"]   else "-"
+            stop_str   = f"${row['stop']:.2f}"   if row["stop"]    else "-"
+            t1_str     = f"${row['target1']:.2f}" if row["target1"] else "-"
+            t2_str     = f"${row['target2']:.2f}" if row["target2"] else "-"
+            rr_str     = f"{row['rr']:.1f}:1"    if row["rr"]      else "-"
+            noticia    = (row["noticia"] or "-")[:55]
 
-            elif col == "Día ant. %":
-                if val is not None and not (isinstance(val, float) and np.isnan(val)):
-                    if val >= 2:    style += "color:#7dff7d;font-weight:bold;"
-                    elif val > 0:   style += "color:#2db82d;"
-                    elif val <= -2: style += "color:#ff6666;font-weight:bold;"
-                    elif val < 0:   style += "color:#ff9999;"
-                    val = f"{val:+.2f}%"
-                else:
-                    val = "-"
+            # Color fila por score
+            if row["score"] >= 70:   bg = "background:#0a1a0a;"
+            elif row["score"] >= 50: bg = "background:#111a0a;"
+            elif row["score"] >= 35: bg = "background:#1a1a0a;"
+            else:                    bg = ""
 
-            elif col == "Pre Vol ratio":
-                if val is not None and not (isinstance(val, float) and np.isnan(val)):
-                    if val >= 0.5:  style += "color:#ffd700;font-weight:bold;"
-                    elif val >= 0.2:style += "color:#90ee90;"
-                    val = f"{val:.2f}x"
-                else:
-                    val = "-"
+            cells = (
+                f'<td style="padding:7px 10px;white-space:nowrap;font-weight:bold;color:white">{row["nombre"]}</td>'
+                f'<td style="padding:7px 10px">{score_bar(row["score"])}</td>'
+                f'<td style="padding:7px 10px">{rating(row["score"])}</td>'
+                f'<td style="padding:7px 10px;min-width:180px">{sigs_html}</td>'
+                f'<td style="padding:7px 10px;color:#ccc">{price_str}</td>'
+                f'<td style="padding:7px 10px">{pct_cell(row["pre_pct"])}</td>'
+                f'<td style="padding:7px 10px;color:#7dff7d;font-weight:bold">{entry_str}</td>'
+                f'<td style="padding:7px 10px;color:#ff9999">{stop_str}</td>'
+                f'<td style="padding:7px 10px;color:#90ee90">{t1_str}</td>'
+                f'<td style="padding:7px 10px;color:#2db82d">{t2_str}</td>'
+                f'<td style="padding:7px 10px;color:#ffd700;font-weight:bold">{rr_str}</td>'
+                f'<td style="padding:7px 10px">{rsi_cell(row["rsi_val"])}</td>'
+                f'<td style="padding:7px 10px">{volz_cell(row["vol_z"])}</td>'
+                f'<td style="padding:7px 10px">{trend_cell(row["trend"])}</td>'
+                f'<td style="padding:7px 10px;color:#888;font-size:0.8em">{noticia}</td>'
+            )
+            rows_html += f'<tr style="{bg}border-bottom:1px solid #1a1a1a">{cells}</tr>'
 
-            elif col == "vs 52w max":
-                if val is not None and not (isinstance(val, float) and np.isnan(val)):
-                    if val >= -3:   style += "background:#0a7a0a;color:white;font-weight:bold;border-radius:4px;"
-                    elif val >= -10:style += "color:#90ee90;"
-                    elif val <= -30:style += "color:#ff6666;"
-                    else:           style += "color:#ff9999;"
-                    val = f"{val:.1f}%"
-                else:
-                    val = "-"
-
-            elif col == "Score Rally":
-                if isinstance(val, (int, float)) and val > 0:
-                    if val >= 60:   style += "background:#0a5a0a;color:#7dff7d;font-weight:bold;border-radius:4px;"
-                    elif val >= 40: style += "background:#3a3a0a;color:#ffd700;font-weight:bold;border-radius:4px;"
-                    elif val >= 20: style += "color:#ffd700;"
-                    val = f"{int(val)}"
-                else:
-                    val = "-"
-
-            elif col == "Tendencia":
-                if val == "↑↑↑":   style += "color:#7dff7d;font-weight:bold;"
-                elif val == "↑↑":  style += "color:#2db82d;"
-                elif val == "↓↓↓": style += "color:#ff6666;font-weight:bold;"
-                elif val == "↓↓":  style += "color:#ff9999;"
-                else:               style += "color:#888;"
-
-            cells += f'<td style="{style}">{val}</td>'
-        rows_html += f"<tr style='border-bottom:1px solid #1a1a1a'>{cells}</tr>"
-
-    table_html = f"""
-    <div style="overflow-x:auto;overflow-y:auto;max-height:600px;margin-top:8px">
-    <table style="border-collapse:collapse;width:100%;font-size:0.85em;">
-        <thead><tr style="position:sticky;top:0;background:#0e1117">{header}</tr></thead>
-        <tbody>{rows_html}</tbody>
-    </table>
-    </div>
-    """
-    st.markdown(table_html, unsafe_allow_html=True)
-    st.caption("Score Rally: premarket% + volumen premarket + cercanía 52w max + tendencia reciente · Actualiza cada 5min")
-
-
-# ── Render ───────────────────────────────────────────────────────────────────
-
-with st.spinner("Escaneando..."):
-    df = scan()
-
-if df.empty:
-    st.error("Sin datos.")
-else:
-    # ── Alerta sonora ─────────────────────────────────────────────────────────
-    alertas = df[df["Día %"] >= min_change]
-    if not alertas.empty and (market_open or premarket):
-        st.markdown("""
-            <script>
-            var ctx = new (window.AudioContext || window.webkitAudioContext)();
-            var osc = ctx.createOscillator();
-            var gain = ctx.createGain();
-            osc.connect(gain); gain.connect(ctx.destination);
-            osc.frequency.value = 880;
-            gain.gain.setValueAtTime(0.3, ctx.currentTime);
-            gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.5);
-            osc.start(ctx.currentTime); osc.stop(ctx.currentTime + 0.5);
-            </script>
+        st.markdown(f"""
+        <div style="overflow-x:auto">
+        <table style="border-collapse:collapse;width:100%;font-size:0.82em">
+            <thead><tr style="background:#0e1117">{header_html}</tr></thead>
+            <tbody>{rows_html}</tbody>
+        </table>
+        </div>
+        <div style="margin-top:8px;color:#666;font-size:0.75em">
+        Score: suma de señales ponderadas (max 100) ·
+        Entry = precio actual/premarket · Stop = Entry − 1.5×ATR14 ·
+        T1 = Entry + 2×ATR14 · T2 = Entry + 3.5×ATR14 ·
+        Vol σ = desviación estándar del volumen vs 20d
+        </div>
         """, unsafe_allow_html=True)
 
-    # ── Cards ganadoras del día ───────────────────────────────────────────────
-    if not alertas.empty:
-        st.subheader(f"🚀 Subiendo ≥ {min_change}% hoy")
-        for i, row in alertas.head(4).iterrows():
-            noticia = get_news(row["_ticker"])
-            df.loc[i, "Noticia"] = noticia[:60] + "..." if len(noticia) > 60 else noticia
-        alertas = df[df["Día %"] >= min_change]
-        cols = st.columns(min(len(alertas), 4))
-        for idx, (_, row) in enumerate(alertas.head(4).iterrows()):
-            with cols[idx]:
-                color = "#1a5c1a" if row["Día %"] >= 0 else "#5c1a1a"
-                st.markdown(f"""
-                    <div style="background:{color};padding:14px;border-radius:10px;text-align:center;margin-bottom:8px">
-                        <div style="color:white;font-size:1.2em;font-weight:bold">{row['Ticker']}</div>
-                        <div style="color:#7dff7d;font-size:1.5em;font-weight:bold">+{row['Día %']:.2f}%</div>
-                        <div style="color:#ccc;font-size:0.75em">${row['Precio']} · Vol {row['Vol ratio']}x</div>
-                        <div style="color:#aaa;font-size:0.7em;margin-top:4px">{row['Noticia']}</div>
-                    </div>
-                """, unsafe_allow_html=True)
-        st.divider()
 
-    # ── Cards premarket (horario premarket) ───────────────────────────────────
-    df["_pre_pct"] = pd.to_numeric(df.get("_pre_pct"), errors="coerce")
-    if premarket:
-        infos = get_info_batch(WATCHLIST[:10])
-        for i, row in df.iterrows():
-            t = row["_ticker"]
-            info = infos.get(t, {})
-            pre = info.get("preMarketPrice")
-            close = info.get("regularMarketPreviousClose")
-            if pre and close and pre > 0:
-                pct = round((pre - close) / close * 100, 2)
-                df.loc[i, "_pre_pct"] = pct
-                df.loc[i, "Premarket %"] = f"{pct:+.2f}%"
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 2 — RADAR PREMARKET
+# ══════════════════════════════════════════════════════════════════════════════
+with tab2:
+    st.markdown("### 🌅 Radar Premarket — Movimientos antes de apertura USA")
 
-        pre_movers = df[df["_pre_pct"].notna() & (pd.to_numeric(df["_pre_pct"], errors="coerce").abs() >= 1)]
-        if not pre_movers.empty:
-            st.subheader("⏰ Movimiento premarket")
-            cols2 = st.columns(min(len(pre_movers), 4))
-            for idx, (_, row) in enumerate(pre_movers.head(4).iterrows()):
-                pct = row["_pre_pct"]
-                color = "#1a5c1a" if pct >= 0 else "#5c1a1a"
-                sign = "+" if pct >= 0 else ""
-                with cols2[idx]:
+    pm_df = df_all[df_all["pre_pct"].notna()].copy()
+    pm_df = pm_df.sort_values("pre_pct", ascending=False).reset_index(drop=True)
+
+    if pm_df.empty:
+        st.info("Datos premarket no disponibles fuera de horario premarket (09:00–15:30 CH).")
+    else:
+        # Cards top movers premarket
+        top_pm = pm_df[pm_df["pre_pct"].abs() >= 1].head(4)
+        if not top_pm.empty:
+            cols = st.columns(min(len(top_pm), 4))
+            for idx, (_, row) in enumerate(top_pm.iterrows()):
+                pct   = row["pre_pct"]
+                color = "#0a3a0a" if pct >= 0 else "#3a0a0a"
+                with cols[idx]:
                     st.markdown(f"""
-                        <div style="background:{color};padding:14px;border-radius:10px;text-align:center">
-                            <div style="color:white;font-size:1.2em;font-weight:bold">{row['Ticker']}</div>
-                            <div style="color:#7dff7d;font-size:1.5em;font-weight:bold">{sign}{pct:.2f}%</div>
-                            <div style="color:#ccc;font-size:0.8em">Premarket</div>
+                        <div style="background:{color};padding:14px;border-radius:10px;
+                                    text-align:center;border:1px solid #2a2a2a">
+                            <div style="color:white;font-size:1.2em;font-weight:bold">{row['nombre']}</div>
+                            <div style="color:#7dff7d;font-size:1.6em;font-weight:bold">{pct:+.2f}%</div>
+                            <div style="color:#ffd700;font-size:0.8em">Score: {row['score']}</div>
+                            <div style="color:#aaa;font-size:0.75em">{row['trend']} · RSI {row['rsi_val'] or '-'}</div>
                         </div>
                     """, unsafe_allow_html=True)
             st.divider()
 
-    # ── TABLA PREMARKET ───────────────────────────────────────────────────────
-    render_premarket_table()
+        # Tabla completa premarket
+        PM_COLS = ["Ticker", "Pre %", "Precio", "Día %", "Score", "Señales",
+                   "Entry", "Stop", "T1", "R:R", "RSI", "Vol σ", "Trend"]
+        hdr = "".join(
+            f'<th style="padding:6px 10px;text-align:left;border-bottom:2px solid #333;'
+            f'color:#aaa;white-space:nowrap;font-size:0.8em">{c}</th>'
+            for c in PM_COLS
+        )
+        rows = ""
+        for _, row in pm_df.iterrows():
+            pct = row["pre_pct"]
+            if pct >= 3:    pre_bg = "background:#0a5a0a;color:white;"
+            elif pct >= 1:  pre_bg = "background:#1a7a1a;color:white;"
+            elif pct > 0:   pre_bg = "background:#2a5a2a;color:white;"
+            elif pct <= -3: pre_bg = "background:#5a0a0a;color:white;"
+            elif pct < 0:   pre_bg = "background:#3a0a0a;color:white;"
+            else:            pre_bg = ""
 
-    st.divider()
+            sigs = " ".join([
+                f'<span style="background:#1a3a1a;color:#7dff7d;padding:1px 4px;'
+                f'border-radius:3px;font-size:0.68em">{SIGNAL_LABELS.get(s,s)}</span>'
+                for s in row["signals"]
+            ]) or "-"
 
-    # ── Tabla completa posiciones ─────────────────────────────────────────────
-    st.subheader("Todas las posiciones")
+            cells = (
+                f'<td style="padding:6px 10px;font-weight:bold;color:white">{row["nombre"]}</td>'
+                f'<td style="padding:6px 10px;{pre_bg}border-radius:4px;font-weight:bold">{pct:+.2f}%</td>'
+                f'<td style="padding:6px 10px;color:#ccc">${row["price"]:.2f}</td>'
+                f'<td style="padding:6px 10px">{pct_cell(row["dia_pct"])}</td>'
+                f'<td style="padding:6px 10px">{score_bar(row["score"])}</td>'
+                f'<td style="padding:6px 10px;min-width:160px">{sigs}</td>'
+                f'<td style="padding:6px 10px;color:#7dff7d">${round(row["entry"],2) if row["entry"] else "-"}</td>'
+                f'<td style="padding:6px 10px;color:#ff9999">${round(row["stop"],2) if row["stop"] else "-"}</td>'
+                f'<td style="padding:6px 10px;color:#90ee90">${round(row["target1"],2) if row["target1"] else "-"}</td>'
+                f'<td style="padding:6px 10px;color:#ffd700">{str(round(row["rr"],1))+":1" if row["rr"] else "-"}</td>'
+                f'<td style="padding:6px 10px">{rsi_cell(row["rsi_val"])}</td>'
+                f'<td style="padding:6px 10px">{volz_cell(row["vol_z"])}</td>'
+                f'<td style="padding:6px 10px">{trend_cell(row["trend"])}</td>'
+            )
+            rows += f'<tr style="border-bottom:1px solid #1a1a1a">{cells}</tr>'
 
-    display = df.drop(columns=["_ticker", "_pre_pct", "_dist52"], errors="ignore").copy()
-    cols_order = ["Ticker", "Precio", "Día %", "Desde open %", "Premarket %", "vs 52w max", "Vol ratio", "Noticia"]
-    cols_order = [c for c in cols_order if c in display.columns]
+        st.markdown(f"""
+        <div style="overflow-x:auto">
+        <table style="border-collapse:collapse;width:100%;font-size:0.82em">
+            <thead><tr style="background:#0e1117">{hdr}</tr></thead>
+            <tbody>{rows}</tbody>
+        </table>
+        </div>""", unsafe_allow_html=True)
 
-    header = "".join(
-        f'<th style="padding:6px 10px;text-align:left;border-bottom:1px solid #333;color:#aaa">{c}</th>'
-        for c in cols_order
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 3 — TODAS LAS POSICIONES
+# ══════════════════════════════════════════════════════════════════════════════
+with tab3:
+    st.markdown("### 📋 Todas las posiciones")
+
+    ALL_COLS = ["Ticker", "Precio", "Día %", "Pre %", "Score",
+                "RSI", "Vol σ", "Trend", "vs 52w", "Noticia"]
+    hdr = "".join(
+        f'<th style="padding:6px 10px;text-align:left;border-bottom:2px solid #333;'
+        f'color:#aaa;white-space:nowrap">{c}</th>'
+        for c in ALL_COLS
     )
 
-    rows_html = ""
-    for _, row in display.iterrows():
-        cells = ""
-        for col in cols_order:
-            val = row[col]
-            style = "padding:6px 10px;white-space:nowrap;"
-            display_val = val
+    all_sorted = df_all.sort_values("dia_pct", ascending=False).reset_index(drop=True)
+    rows = ""
+    for _, row in all_sorted.iterrows():
+        dist52_str = f"{row['dist52']:.1f}%" if row["dist52"] is not None else "-"
+        if row["dist52"] is not None:
+            if row["dist52"] >= -3:    d52_style = "background:#0a5a0a;color:white;font-weight:bold;border-radius:4px;"
+            elif row["dist52"] >= -10: d52_style = "color:#90ee90;"
+            elif row["dist52"] <= -30: d52_style = "color:#ff6666;"
+            else:                      d52_style = "color:#ff9999;"
+        else:
+            d52_style = "color:#555;"
 
-            if col == "Día %":
-                bg, fg = cell_color(val)
-                display_val = fmt_pct(val)
-                if bg:
-                    style += f"background:{bg};color:{fg};font-weight:bold;border-radius:4px;"
-            elif col == "Desde open %":
-                bg, fg = cell_color(val)
-                display_val = fmt_pct(val)
-                if bg:
-                    style += f"background:{bg};color:{fg};border-radius:4px;"
-            elif col == "Premarket %":
-                if val != "-" and val:
-                    try:
-                        n = float(str(val).replace("%","").replace("+",""))
-                        bg = "#0a7a0a" if n >= 2 else "#1a9a1a" if n > 0 else "#6b0a0a" if n <= -2 else "#8a1a1a"
-                        style += f"background:{bg};color:white;border-radius:4px;"
-                    except: pass
-                display_val = val
-            elif col == "vs 52w max":
-                if val != "-" and val:
-                    try:
-                        n = float(str(val).replace("%",""))
-                        if n >= -3:   style += "background:#0a7a0a;color:white;font-weight:bold;border-radius:4px;"
-                        elif n >= -10:style += "color:#2db82d;"
-                        elif n <= -30:style += "color:#ff6666;"
-                        else:         style += "color:#ff9999;"
-                    except: pass
-                display_val = val
-            elif col == "Precio":
-                try: display_val = f"{float(val):.2f}"
-                except: pass
-            elif col == "Vol ratio":
-                try: display_val = f"{float(val):.2f}x"
-                except: pass
+        cells = (
+            f'<td style="padding:6px 10px;font-weight:bold;color:white">{row["nombre"]}</td>'
+            f'<td style="padding:6px 10px;color:#ccc">${row["price"]:.2f if row["price"] else "-"}</td>'
+            f'<td style="padding:6px 10px">{pct_cell(row["dia_pct"], bold=True)}</td>'
+            f'<td style="padding:6px 10px">{pct_cell(row["pre_pct"])}</td>'
+            f'<td style="padding:6px 10px">{score_bar(row["score"])}</td>'
+            f'<td style="padding:6px 10px">{rsi_cell(row["rsi_val"])}</td>'
+            f'<td style="padding:6px 10px">{volz_cell(row["vol_z"])}</td>'
+            f'<td style="padding:6px 10px">{trend_cell(row["trend"])}</td>'
+            f'<td style="padding:6px 10px;{d52_style}">{dist52_str}</td>'
+            f'<td style="padding:6px 10px;color:#777;font-size:0.8em">{(row["noticia"] or "-")[:55]}</td>'
+        )
+        rows += f'<tr style="border-bottom:1px solid #1a1a1a">{cells}</tr>'
 
-            cells += f'<td style="{style}">{display_val}</td>'
-        rows_html += f"<tr>{cells}</tr>"
-
-    table_html = f"""
-    <div style="overflow-x:auto;overflow-y:auto;max-height:700px;">
-    <table style="border-collapse:collapse;width:100%;font-size:0.85em;">
-        <thead><tr style="position:sticky;top:0;background:#0e1117">{header}</tr></thead>
-        <tbody>{rows_html}</tbody>
+    st.markdown(f"""
+    <div style="overflow-x:auto;max-height:750px;overflow-y:auto">
+    <table style="border-collapse:collapse;width:100%;font-size:0.82em">
+        <thead><tr style="position:sticky;top:0;background:#0e1117">{hdr}</tr></thead>
+        <tbody>{rows}</tbody>
     </table>
     </div>
-    """
-    st.markdown(table_html, unsafe_allow_html=True)
-    st.caption("Verde oscuro en '52w max' = cerca de máximo anual · 'Desde open' = movimiento desde apertura de hoy · Auto-refresh cada 5min si activado")
+    <div style="margin-top:8px;color:#666;font-size:0.75em">
+    Vol σ = desviación estándar del volumen vs 20 días ·
+    vs 52w = distancia al máximo anual ·
+    Trend = alineación EMA 9/21/50
+    </div>
+    """, unsafe_allow_html=True)
