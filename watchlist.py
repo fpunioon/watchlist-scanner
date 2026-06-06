@@ -22,6 +22,17 @@ except ImportError:
 st.set_page_config(page_title="Watchlist Scanner", layout="wide")
 
 # ── Constantes ────────────────────────────────────────────────────────────────
+
+# Posiciones propias — se marcan en la tabla
+MIS_POSICIONES = {
+    "NVDA": {"acc": 232.13, "pm": 167.59},
+    "LLY":  {"acc": 34.70,  "pm": 1123.15},
+    "MSFT": {"acc": 50.53,  "pm": 374.50},
+    "GOOG": {"acc": 54.27,  "pm": 274.09},
+    "AMZN": {"acc": 47.10,  "pm": 248.52},
+    "VOO":  {"acc": 97.70,  "pm": 601.51},
+}
+
 WATCHLIST = [
     "V", "LHX", "TSM", "NRG", "ARM", "RTX", "LLY", "SNOW", "XOM",
     "NVDA", "GOOG", "MSFT", "QQQ", "AMD", "SLV", "UEC",
@@ -122,6 +133,50 @@ def fetch_news_bulk():
             out[t] = "-"
     return out
 
+@st.cache_data(ttl=3600)
+def fetch_earnings_dates():
+    """Próximas fechas de earnings para todos los tickers."""
+    out = {}
+    for t in WATCHLIST:
+        try:
+            tk = yf.Ticker(t)
+            cal = tk.calendar
+            if cal is not None and not cal.empty and 'Earnings Date' in cal.index:
+                ed = cal.loc['Earnings Date']
+                val = ed.values[0] if hasattr(ed, 'values') else ed
+                if hasattr(val, 'date'):
+                    out[t] = val.date()
+                else:
+                    out[t] = None
+            else:
+                out[t] = None
+        except Exception:
+            out[t] = None
+    return out
+
+def sentiment_noticia(titulo):
+    """Sentiment básico del titular: positivo/negativo/neutro."""
+    if not titulo or titulo == "-":
+        return "neutro"
+    titulo_lower = titulo.lower()
+    pos = ["surges","soars","jumps","beats","rally","record","strong","growth",
+           "upgrade","buy","bullish","rises","gains","higher","top"]
+    neg = ["falls","drops","misses","cut","downgrade","sell","bearish","lower",
+           "weak","decline","crash","plunges","warns","loss","disappoints"]
+    score = sum(1 for w in pos if w in titulo_lower) - sum(1 for w in neg if w in titulo_lower)
+    return "positivo" if score > 0 else "negativo" if score < 0 else "neutro"
+
+def dias_para_earnings(fecha_earnings):
+    """Días hasta el próximo earnings."""
+    if not fecha_earnings:
+        return None
+    try:
+        hoy = datetime.now().date()
+        delta = (fecha_earnings - hoy).days
+        return delta if delta >= 0 else None
+    except Exception:
+        return None
+
 
 # ── Indicadores ──────────────────────────────────────────────────────────────
 
@@ -167,6 +222,9 @@ def analyze_ticker(ticker, raw60, raw1y, info):
     """
     Devuelve dict con score, señales, entry, stop, target, indicadores.
     """
+    en_cartera = ticker in MIS_POSICIONES or ticker.replace("GOOG","GOOGL") in MIS_POSICIONES
+    pm_propio  = MIS_POSICIONES.get(ticker, MIS_POSICIONES.get(ticker.replace("GOOG","GOOGL"), {})).get("pm")
+
     result = {
         "ticker": ticker,
         "nombre": TICKER_NAMES.get(ticker, ticker),
@@ -184,6 +242,11 @@ def analyze_ticker(ticker, raw60, raw1y, info):
         "dia_pct": None,
         "atr_val": None,
         "rel_str": None,
+        "en_cartera": en_cartera,
+        "pm_propio": pm_propio,
+        "vs_pm_propio": None,
+        "earnings_dias": None,
+        "sentiment": "neutro",
     }
 
     try:
@@ -375,6 +438,10 @@ def analyze_ticker(ticker, raw60, raw1y, info):
         result["score"]   = min(score, 100)
         result["signals"] = signals
 
+        # ── vs PM propio ──────────────────────────────────────────────────────
+        if pm_propio and price:
+            result["vs_pm_propio"] = round((price - pm_propio) / pm_propio * 100, 2)
+
     except Exception as e:
         pass
 
@@ -434,16 +501,20 @@ def trend_cell(t):
 # ══════════════════════════════════════════════════════════════════════════════
 
 with st.spinner("Analizando mercado..."):
-    raw60  = fetch_ohlcv()
-    raw1y  = fetch_52w()
-    infos  = fetch_info_all()
-    news   = fetch_news_bulk()
+    raw60    = fetch_ohlcv()
+    raw1y    = fetch_52w()
+    infos    = fetch_info_all()
+    news     = fetch_news_bulk()
+    earnings = fetch_earnings_dates()
 
 # Analizar todos los tickers
 results = []
 for t in WATCHLIST:
     r = analyze_ticker(t, raw60, raw1y, infos.get(t, {}))
-    r["noticia"] = news.get(t, "-")
+    titulo = news.get(t, "-")
+    r["noticia"]       = titulo
+    r["sentiment"]     = sentiment_noticia(titulo)
+    r["earnings_dias"] = dias_para_earnings(earnings.get(t))
     results.append(r)
 
 df_all = pd.DataFrame(results)
@@ -469,21 +540,24 @@ with tab1:
         cols = st.columns(4)
         for idx, (_, row) in enumerate(top4.iterrows()):
             with cols[idx]:
-                sigs  = " · ".join([SIGNAL_LABELS.get(s, s) for s in row["signals"]])
-                color = "#0a3a0a" if row["score"] >= 50 else "#3a3a0a"
-                pre_str = f"Pre: {row['pre_pct']:+.2f}%" if row["pre_pct"] else ""
+                sigs      = " · ".join([SIGNAL_LABELS.get(s, s) for s in row["signals"]])
+                color     = "#0a3a0a" if row["score"] >= 50 else "#3a3a0a"
+                pre_str   = f"Pre: {row['pre_pct']:+.2f}%" if row["pre_pct"] else ""
                 entry_str = f"Entry: ${row['entry']}" if row["entry"] else ""
-                rr_str = f"R:R {row['rr']}:1" if row["rr"] else ""
+                rr_str    = f"R:R {row['rr']}:1" if row["rr"] else ""
                 price_disp = f"{row['price']:.2f}" if row["price"] else "-"
+                cartera_badge = "🏦 EN CARTERA" if row.get("en_cartera") else ""
+                earn_str = f"⚠️ Earnings en {row['earnings_dias']}d" if row.get("earnings_dias") and row["earnings_dias"] <= 14 else ""
+                sent_icon = "📰🟢" if row.get("sentiment") == "positivo" else "📰🔴" if row.get("sentiment") == "negativo" else ""
                 st.markdown(f"""
                     <div style="background:{color};padding:14px;border-radius:10px;
                                 border:1px solid #2a5a2a;margin-bottom:8px">
-                        <div style="color:white;font-size:1.2em;font-weight:bold">{row['nombre']}</div>
+                        <div style="color:white;font-size:1.2em;font-weight:bold">{row['nombre']} {cartera_badge}</div>
                         <div style="color:#7dff7d;font-size:1.4em;font-weight:bold">Score: {row['score']}</div>
                         <div style="color:#ffd700;font-size:0.75em;margin:4px 0">{sigs}</div>
                         <div style="color:#ccc;font-size:0.8em">${price_disp} · RSI {row['rsi_val'] or '-'}</div>
                         <div style="color:#aaa;font-size:0.75em">{entry_str} · {rr_str}</div>
-                        <div style="color:#90ee90;font-size:0.7em">{pre_str}</div>
+                        <div style="color:#90ee90;font-size:0.7em">{pre_str} {earn_str} {sent_icon}</div>
                     </div>
                 """, unsafe_allow_html=True)
 
@@ -492,9 +566,9 @@ with tab1:
         # Tabla detallada de oportunidades
         st.markdown("#### Detalle de señales y niveles operativos")
 
-        COLS = ["Ticker", "Score", "Rating", "Señales", "Precio", "Pre %",
-                "Entry", "Stop", "T1", "T2", "R:R",
-                "RSI", "Vol σ", "Trend", "Noticia"]
+        COLS = ["Ticker", "Score", "Rating", "Señales", "Precio", "vs PM",
+                "Pre %", "Entry", "Stop", "T1", "R:R",
+                "RSI", "Vol σ", "Trend", "Earnings", "Noticia"]
 
         header_html = "".join(
             f'<th style="padding:7px 10px;text-align:left;border-bottom:2px solid #333;'
@@ -523,22 +597,42 @@ with tab1:
             elif row["score"] >= 35: bg = "background:#1a1a0a;"
             else:                    bg = ""
 
+            # Campos nuevos
+            vs_pm_str = pct_cell(row.get("vs_pm_propio")) if row.get("en_cartera") else "-"
+            cartera_label = f'🏦 {row["nombre"]}' if row.get("en_cartera") else row["nombre"]
+
+            earn_d = row.get("earnings_dias")
+            if earn_d is not None and earn_d <= 7:
+                earn_str = f'<span style="color:#ff6666;font-weight:bold">⚠️ {earn_d}d</span>'
+            elif earn_d is not None and earn_d <= 14:
+                earn_str = f'<span style="color:#ffd700">{earn_d}d</span>'
+            elif earn_d is not None:
+                earn_str = f'<span style="color:#888">{earn_d}d</span>'
+            else:
+                earn_str = "-"
+
+            sent = row.get("sentiment", "neutro")
+            sent_html = (f'<span style="color:#7dff7d">🟢</span>' if sent == "positivo"
+                        else f'<span style="color:#ff6666">🔴</span>' if sent == "negativo"
+                        else "")
+
             cells = (
-                f'<td style="padding:7px 10px;white-space:nowrap;font-weight:bold;color:white">{row["nombre"]}</td>'
+                f'<td style="padding:7px 10px;white-space:nowrap;font-weight:bold;color:white">{cartera_label}</td>'
                 f'<td style="padding:7px 10px">{score_bar(row["score"])}</td>'
                 f'<td style="padding:7px 10px">{rating(row["score"])}</td>'
                 f'<td style="padding:7px 10px;min-width:180px">{sigs_html}</td>'
                 f'<td style="padding:7px 10px;color:#ccc">{price_str}</td>'
+                f'<td style="padding:7px 10px">{vs_pm_str}</td>'
                 f'<td style="padding:7px 10px">{pct_cell(row["pre_pct"])}</td>'
                 f'<td style="padding:7px 10px;color:#7dff7d;font-weight:bold">{entry_str}</td>'
                 f'<td style="padding:7px 10px;color:#ff9999">{stop_str}</td>'
                 f'<td style="padding:7px 10px;color:#90ee90">{t1_str}</td>'
-                f'<td style="padding:7px 10px;color:#2db82d">{t2_str}</td>'
                 f'<td style="padding:7px 10px;color:#ffd700;font-weight:bold">{rr_str}</td>'
                 f'<td style="padding:7px 10px">{rsi_cell(row["rsi_val"])}</td>'
                 f'<td style="padding:7px 10px">{volz_cell(row["vol_z"])}</td>'
                 f'<td style="padding:7px 10px">{trend_cell(row["trend"])}</td>'
-                f'<td style="padding:7px 10px;color:#888;font-size:0.8em">{noticia}</td>'
+                f'<td style="padding:7px 10px;text-align:center">{earn_str}</td>'
+                f'<td style="padding:7px 10px;color:#888;font-size:0.8em">{sent_html} {noticia}</td>'
             )
             rows_html += f'<tr style="{bg}border-bottom:1px solid #1a1a1a">{cells}</tr>'
 
