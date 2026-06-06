@@ -25,12 +25,11 @@ st.set_page_config(page_title="Watchlist Scanner", layout="wide")
 
 # Posiciones propias — se marcan en la tabla
 MIS_POSICIONES = {
-    "NVDA": {"acc": 232.13, "pm": 167.59},
-    "LLY":  {"acc": 34.70,  "pm": 1123.15},
+    "NVDA": {"acc": 216.13, "pm": 167.59},  # post-venta 16 acc lunes
     "MSFT": {"acc": 50.53,  "pm": 374.50},
     "GOOG": {"acc": 54.27,  "pm": 274.09},
-    "AMZN": {"acc": 47.10,  "pm": 248.52},
     "VOO":  {"acc": 97.70,  "pm": 601.51},
+    # LLY y AMZN vendidas el lunes 09/06
 }
 
 WATCHLIST = [
