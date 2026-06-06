@@ -61,15 +61,20 @@ SIGNAL_LABELS = {
 }
 
 # ── Hora CH ───────────────────────────────────────────────────────────────────
-ch_tz      = pytz.timezone("Europe/Zurich")
-now_ch     = datetime.now(ch_tz)
-t_min      = now_ch.hour * 60 + now_ch.minute
-premarket  = 9*60 <= t_min < 15*60+30
-market_open = 15*60+30 <= t_min <= 22*60
+ch_tz       = pytz.timezone("Europe/Zurich")
+now_ch      = datetime.now(ch_tz)
+t_min       = now_ch.hour * 60 + now_ch.minute
+es_finde    = now_ch.weekday() >= 5  # 5=sábado, 6=domingo
+premarket   = not es_finde and 9*60 <= t_min < 15*60+30
+market_open = not es_finde and 15*60+30 <= t_min <= 22*60
 
 # ── Header ───────────────────────────────────────────────────────────────────
 st.title("Watchlist Scanner")
-if premarket:
+if es_finde:
+    dia = "domingo" if now_ch.weekday() == 6 else "sábado"
+    badge = f"📅 {dia.upper()} — Mercado abre el lunes 15:30 CH"
+    bcol  = "#3a3a3a"
+elif premarket:
     mins = (15*60+30) - t_min
     badge = f"⏰ PREMARKET — Apertura en {mins} min"
     bcol  = "#a85a00"
