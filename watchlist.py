@@ -4,11 +4,13 @@ Señales institucionales: Breakout, Momentum, Gap Rally, Pullback, Oversold Boun
 Calcula automáticamente Entry / Stop / Target / R:R por cada ticker
 """
 
+import os
 import streamlit as st
-import yfinance as yf
+import requests
+import yfinance as yf   # solo para el calendario de earnings (Massive no lo da en el plan de acciones)
 import pandas as pd
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
 import warnings
 warnings.filterwarnings("ignore")
@@ -47,21 +49,29 @@ TICKER_NAMES = {
     "MU": "Micron", "BRK-B": "Berkshire",
 }
 
+# Conversión de símbolos al formato de Massive (clases con punto, cripto con X:).
+# None = mercado no cubierto por el plan de acciones (se omite del scan).
+POLY_SYMBOL = {
+    "BRK-B":   "BRK.B",
+    "ETH-USD": "X:ETHUSD",
+    "GC=F":    None,        # oro (futuro): otro mercado, sin cobertura en plan acciones
+}
+
 SIGNAL_LABELS = {
-    "BREAKOUT":       "🚀 Breakout 52w",
-    "MOMENTUM":       "⚡ Momentum",
-    "GAP_RALLY":      "📈 Gap Rally",
-    "PULLBACK_BUY":   "🔄 Pullback EMA",
-    "OVERSOLD":       "🏹 Oversold Bounce",
-    "PREMARKET_MOVE": "⏰ Pre-mkt Move",
-    "RELATIVE_STRONG":"💪 Rel. Strength",
-    "VOL_SPIKE":      "🔥 Vol Spike",
-    "NEAR_52W":       "📌 Near 52w High",
+    "TREND":      "📈 Tendencia validada",
+    "PULLBACK":   "🔄 Pullback en tendencia",
+    "BREAKOUT":   "🚀 Breakout c/ volumen",
+    "OVERSOLD":   "🏹 Rebote sobre soporte",
+    "EXTENDED":   "⚠️ Extendido (no entrar)",
+    "VOL_SPIKE":  "🔥 Vol anómalo",
+    "EARNINGS":   "📅 Earnings próximo",
 }
 
 # ── Hora CH ───────────────────────────────────────────────────────────────────
 ch_tz       = pytz.timezone("Europe/Zurich")
 now_ch      = datetime.now(ch_tz)
+# Hora redondeada al minuto más cercano para el badge (evita el retraso por truncar segundos)
+now_ch_disp = now_ch + timedelta(seconds=30)
 t_min       = now_ch.hour * 60 + now_ch.minute
 es_finde    = now_ch.weekday() >= 5  # 5=sábado, 6=domingo
 premarket   = not es_finde and 9*60 <= t_min < 15*60+30
@@ -84,11 +94,11 @@ else:
 
 st.markdown(f'<div style="background:{bcol};padding:8px 16px;border-radius:8px;'
             f'display:inline-block;margin-bottom:8px">'
-            f'<span style="color:white;font-weight:bold">{badge} · {now_ch.strftime("%H:%M")} CH</span>'
+            f'<span style="color:white;font-weight:bold">{badge} · {now_ch_disp.strftime("%H:%M")} CH</span>'
             f'</div>', unsafe_allow_html=True)
 
 c1, c2, c3 = st.columns([2, 1, 1])
-with c1: min_score = st.slider("Score mínimo para alertas", 10, 80, 20, 5)
+with c1: min_score = st.slider("Score mínimo para alertas", 10, 90, 40, 5)
 with c2: auto      = st.checkbox("Auto-refresh 5min", value=market_open or premarket)
 with c3: st.button("🔄 Actualizar", use_container_width=True)
 
@@ -97,44 +107,88 @@ if auto and HAS_AUTOREFRESH:
 st.caption(f"Actualizado: {now_ch.strftime('%H:%M:%S')}")
 
 
+# ── API Massive (ex Polygon.io) ────────────────────────────────────────────────
+API_BASE = "https://api.polygon.io"   # api.massive.com también vale; este sigue activo
+
+def _api_key():
+    try:
+        return st.secrets["MASSIVE_API_KEY"]
+    except Exception:
+        return os.environ.get("MASSIVE_API_KEY", "")
+
+API_KEY = _api_key()
+
+def _poly_symbol(t):
+    """Convierte el ticker de la watchlist al símbolo de Massive (None = se omite)."""
+    return POLY_SYMBOL.get(t, t)
+
+
 # ── Fetch ─────────────────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=290)
 def fetch_ohlcv():
-    """60 días diarios — suficiente para todos los indicadores."""
-    df = yf.download(WATCHLIST, period="60d", interval="1d",
-                     progress=False, auto_adjust=True, group_by="ticker")
-    return df
-
-@st.cache_data(ttl=290)
-def fetch_52w():
-    df = yf.download(WATCHLIST, period="1y", interval="1d",
-                     progress=False, auto_adjust=True, group_by="ticker")
-    return df
-
-@st.cache_data(ttl=120)
-def fetch_info_all():
+    """Histórico diario de ~1 año por ticker (para EMA200, ROC60, swing y resistencias)."""
+    to_d   = datetime.now().strftime("%Y-%m-%d")
+    from_d = (datetime.now() - timedelta(days=400)).strftime("%Y-%m-%d")
     out = {}
     for t in WATCHLIST:
+        sym = _poly_symbol(t)
+        if not sym:
+            continue
         try:
-            out[t] = yf.Ticker(t).info
+            url = (f"{API_BASE}/v2/aggs/ticker/{sym}/range/1/day/{from_d}/{to_d}"
+                   f"?adjusted=true&sort=asc&limit=400&apiKey={API_KEY}")
+            res = requests.get(url, timeout=20).json().get("results") or []
+            if len(res) < 20:
+                continue
+            df = pd.DataFrame(res).rename(
+                columns={"o": "Open", "h": "High", "l": "Low", "c": "Close", "v": "Volume"})
+            df.index = pd.to_datetime(df["t"], unit="ms")
+            out[t] = df[["Open", "High", "Low", "Close", "Volume"]]
         except Exception:
-            out[t] = {}
+            continue
     return out
 
 @st.cache_data(ttl=120)
+def fetch_info_all():
+    """Snapshot en vivo de TODOS los tickers en una sola llamada (precio y premarket reales)."""
+    out  = {t: {} for t in WATCHLIST}
+    rev  = {(_poly_symbol(t) or t): t for t in WATCHLIST}
+    syms = ",".join(s for s in (_poly_symbol(t) for t in WATCHLIST) if s)
+    try:
+        url = (f"{API_BASE}/v2/snapshot/locale/us/markets/stocks/tickers"
+               f"?tickers={syms}&apiKey={API_KEY}")
+        data = requests.get(url, timeout=20).json().get("tickers", []) or []
+        for item in data:
+            t = rev.get(item.get("ticker"))
+            if not t:
+                continue
+            minbar = item.get("min") or {}
+            last   = minbar.get("c") or (item.get("lastTrade") or {}).get("p")
+            info = {}
+            if premarket and last:          # solo dentro de la ventana premarket
+                info["preMarketPrice"] = last
+            out[t] = info
+    except Exception:
+        pass
+    return out
+
+@st.cache_data(ttl=300)
 def fetch_news_bulk():
-    out = {}
+    """Último titular por ticker desde el endpoint de noticias de Massive."""
+    out = {t: "-" for t in WATCHLIST}
     for t in WATCHLIST:
+        sym = _poly_symbol(t)
+        if not sym or sym.startswith("X:"):
+            continue
         try:
-            news = yf.Ticker(t).news
-            if news:
-                title = news[0].get("content", {}).get("title", "") or news[0].get("title", "")
+            url = f"{API_BASE}/v2/reference/news?ticker={sym}&limit=1&apiKey={API_KEY}"
+            res = requests.get(url, timeout=15).json().get("results") or []
+            if res:
+                title = res[0].get("title", "") or ""
                 out[t] = title[:70] + ("..." if len(title) > 70 else "")
-            else:
-                out[t] = "-"
         except Exception:
-            out[t] = "-"
+            continue
     return out
 
 @st.cache_data(ttl=3600)
@@ -254,7 +308,7 @@ def analyze_ticker(ticker, raw60, raw1y, info):
     }
 
     try:
-        if ticker not in raw60.columns.get_level_values(0):
+        if ticker not in raw60:
             return result
         df = raw60[ticker].dropna()
         if len(df) < 20:
@@ -274,27 +328,33 @@ def analyze_ticker(ticker, raw60, raw1y, info):
 
         # ── Indicadores ──────────────────────────────────────────────────────
         rsi14    = rsi(close, 14)
-        ema9_s   = ema(close, 9)
-        ema21_s  = ema(close, 21)
+        ema20_s  = ema(close, 20)
         ema50_s  = ema(close, 50)
+        ema200_s = ema(close, 200) if len(close) >= 200 else ema(close, max(50, len(close) // 2))
         atr14    = atr(high, low, close, 14)
         vol_z    = vol_zscore(volume)
-        macd_bull, macd_diff = macd_signal(close)
 
         rsi_val  = float(rsi14.iloc[-1])
-        ema9     = float(ema9_s.iloc[-1])
-        ema21    = float(ema21_s.iloc[-1])
+        prev_rsi = float(rsi14.iloc[-2]) if len(rsi14) >= 2 else rsi_val
+        ema20    = float(ema20_s.iloc[-1])
         ema50    = float(ema50_s.iloc[-1])
+        ema200   = float(ema200_s.iloc[-1])
         atr_val  = float(atr14.iloc[-1]) if not pd.isna(atr14.iloc[-1]) else price * 0.02
 
         result["rsi_val"] = round(rsi_val, 1)
         result["vol_z"]   = round(vol_z, 2)
         result["atr_val"] = round(atr_val, 2)
 
-        # ── Fuerza relativa vs QQQ (calculada aquí para poder usarla abajo) ──
+        # ── ROC (rate of change) y pendiente de la media ──────────────────────
+        roc20 = float((price / float(close.iloc[-21]) - 1) * 100) if len(close) >= 21 else 0.0
+        roc60 = float((price / float(close.iloc[-61]) - 1) * 100) if len(close) >= 61 else 0.0
+        ema50_slope = (float((ema50 - float(ema50_s.iloc[-6])) / float(ema50_s.iloc[-6]) * 100)
+                       if len(ema50_s) >= 6 else 0.0)
+
+        # ── Fuerza relativa vs QQQ ────────────────────────────────────────────
         qqq_pct = 0.0
         try:
-            if "QQQ" in raw60.columns.get_level_values(0):
+            if "QQQ" in raw60:
                 dq = raw60["QQQ"].dropna()
                 if len(dq) >= 2:
                     qqq_pct = float((dq["Close"].iloc[-1] - dq["Close"].iloc[-2]) / dq["Close"].iloc[-2] * 100)
@@ -303,141 +363,137 @@ def analyze_ticker(ticker, raw60, raw1y, info):
         rel_strength = round((result["dia_pct"] or 0) - qqq_pct, 2)
         result["rel_str"] = rel_strength
 
-        # ── 52w distancia ─────────────────────────────────────────────────────
-        high52 = None
-        if ticker in raw1y.columns.get_level_values(0):
-            df1y = raw1y[ticker].dropna()
-            if not df1y.empty and "High" in df1y.columns:
-                high52 = float(df1y["High"].astype(float).max())
+        # ── Estructura: swing low y resistencia previa ────────────────────────
+        swing_low = float(low.tail(20).min())
+        resist_60 = float(high.tail(60).max())
+        high20    = float(high.tail(20).max())
+
+        # ── 52w distancia (sobre el propio histórico de 1 año) ────────────────
+        high52 = float(high.max())
         if high52 and high52 > 0:
             result["dist52"] = round((price - high52) / high52 * 100, 1)
 
-        # ── Tendencia (alineación EMAs) ───────────────────────────────────────
-        if price > ema9 > ema21 > ema50:
+        # ── Tendencia (alineación EMA 20/50/200) ──────────────────────────────
+        if price > ema20 > ema50 > ema200:
             result["trend"] = "↑↑↑"
-        elif price > ema9 > ema21:
+        elif price > ema50 > ema200:
             result["trend"] = "↑↑"
-        elif price > ema9:
+        elif price > ema50:
             result["trend"] = "↑"
-        elif price < ema9 < ema21 < ema50:
+        elif price < ema20 < ema50 < ema200:
             result["trend"] = "↓↓↓"
-        elif price < ema9 < ema21:
+        elif price < ema50 < ema200:
             result["trend"] = "↓↓"
         else:
             result["trend"] = "→"
 
-        # ── Premarket ─────────────────────────────────────────────────────────
+        # ── Premarket (best-effort vía .info) ─────────────────────────────────
         pre_price = info.get("preMarketPrice")
         if pre_price and prev_close and prev_close > 0:
             result["pre_pct"] = round((pre_price - prev_close) / prev_close * 100, 2)
 
-        # ── Vol ratio (premarket) ─────────────────────────────────────────────
-        avg_vol   = info.get("averageVolume") or 0
-        pre_vol   = info.get("preMarketVolume") or 0
-        vol_ratio = round(pre_vol / avg_vol, 2) if avg_vol > 0 else 0
-
-        # ── Pendiente EMA50 ───────────────────────────────────────────────────
-        ema50_slope = 0.0
-        if len(ema50_s) >= 5:
-            ema50_slope = float((ema50_s.iloc[-1] - ema50_s.iloc[-5]) / ema50_s.iloc[-5] * 100)
-
-        prev_rsi = float(rsi14.iloc[-2]) if len(rsi14) >= 2 else rsi_val
-        in_uptrend = ema50 > float(ema50_s.iloc[-10]) if len(ema50_s) >= 10 else False
-        near_ema9  = abs(price - ema9)  / ema9  < 0.015
-        near_ema21 = abs(price - ema21) / ema21 < 0.025
+        # ── Distancia a las medias (pullback vs extensión) ────────────────────
+        dist_ema20 = (price - ema20) / ema20 * 100
+        dist_ema50 = (price - ema50) / ema50 * 100
+        near_ema20 = -1.5 <= dist_ema20 <= 4.0
+        near_ema50 = -1.5 <= dist_ema50 <= 5.0
 
         # ═════════════════════════════════════════════════════════════════════
-        # MOTOR DE SEÑALES — funciona en mercados alcistas Y bajistas
+        # MOTOR DE SEÑALES — solo setups en tendencia validada
         # ═════════════════════════════════════════════════════════════════════
-        score   = 0
+
+        # Gate de tendencia REAL: precio > EMA50 > EMA200, ROC positivo a 20 y 60
+        # sesiones y media de 50 al alza. Esto descarta JNJ (ROC60 negativo) y
+        # BRK plano (slope ≈ 0). "Cerca de máximos" ya no basta.
+        trend_validated = (price > ema50 > ema200
+                           and ema50_slope > 0
+                           and roc20 > 0 and roc60 > 0)
+
         signals = []
+        setup   = None     # "PULLBACK" | "BREAKOUT" | "OVERSOLD"
+        entry   = None
 
-        # ── 1. BREAKOUT 52w ───────────────────────────────────────────────────
-        if (result["dist52"] is not None and result["dist52"] >= -3
-                and vol_z >= 0.8 and 45 <= rsi_val <= 82 and macd_bull):
-            s = 40 + min(10, int(vol_z * 3))
-            s += 5 if result["dist52"] >= -1 else 0
-            score += s
-            signals.append("BREAKOUT")
+        if trend_validated:
+            signals.append("TREND")
 
-        # ── 2. MOMENTUM ──────────────────────────────────────────────────────
-        if (result["trend"] in ("↑↑↑", "↑↑")
-                and 50 <= rsi_val <= 78
-                and macd_bull
-                and result["dia_pct"] and result["dia_pct"] >= 1.0):
-            s = 30
-            s += 10 if result["trend"] == "↑↑↑" else 0
-            s += 5  if vol_z >= 1.0 else 0
-            s += 5  if rel_strength > 2 else 0
-            score += s
-            signals.append("MOMENTUM")
+            # 1. PULLBACK — retroceso a EMA20/50 con RSI saliendo de zona media.
+            #    Es el setup preferente: comprar el retroceso, no la extensión.
+            if (near_ema20 or near_ema50) and 38 <= rsi_val <= 60 and rsi_val >= prev_rsi - 1:
+                setup = "PULLBACK"
+                signals.append("PULLBACK")
+                entry = price
 
-        # ── 3. GAP RALLY premarket ────────────────────────────────────────────
-        if (result["pre_pct"] and result["pre_pct"] >= 1.5 and rsi_val < 78):
-            s = 25 + min(20, int(abs(result["pre_pct"]) * 3))
-            s += 5 if result["trend"] in ("↑↑↑", "↑↑") else 0
-            score += s
-            signals.append("GAP_RALLY")
+            # 2. BREAKOUT — rompiendo el máximo de 20 sesiones con volumen.
+            elif price >= high20 * 0.995 and vol_z >= 1.0 and 50 <= rsi_val <= 72:
+                setup = "BREAKOUT"
+                signals.append("BREAKOUT")
+                entry = price
 
-        # ── 4. PULLBACK A EMA (buy the dip) ──────────────────────────────────
-        if (in_uptrend and ema50_slope > 0
-                and (near_ema9 or near_ema21)
-                and 35 <= rsi_val <= 60):
-            s = 25 + (5 if near_ema9 else 0) + (5 if ema50_slope > 0.5 else 0)
-            score += s
-            signals.append("PULLBACK_BUY")
+            # 3. EXTENDIDO — tendencia buena pero RSI vertical / lejos de la media.
+            #    Caso ASML (RSI 68 en vertical): NO se entra, solo se vigila.
+            elif rsi_val > 68 or dist_ema20 > 8:
+                signals.append("EXTENDED")
 
-        # ── 5. OVERSOLD BOUNCE ────────────────────────────────────────────────
-        if (rsi_val < 38 and rsi_val > prev_rsi and vol_z >= 0.8):
-            s = 25 + (10 if rsi_val < 28 else 0) + (5 if vol_z >= 1.5 else 0)
-            score += s
+        # 4. OVERSOLD BOUNCE — rebote sobre soporte dentro de tendencia de fondo.
+        if (setup is None and price > ema200 and ema50_slope > -0.5
+                and rsi_val < 34 and rsi_val > prev_rsi and vol_z >= 0.8):
+            setup = "OVERSOLD"
             signals.append("OVERSOLD")
+            entry = price
 
-        # ── 6. FUERZA RELATIVA (aguanta cuando el mercado cae) ────────────────
-        if (rel_strength >= 3 and result["dia_pct"] and result["dia_pct"] > 0
-                and qqq_pct < -0.5):
-            s = 20 + min(15, int(rel_strength * 2))
-            score += s
-            signals.append("RELATIVE_STRONG")
-
-        # ── 7. VOL SPIKE con movimiento (catalizador sin confirmar) ───────────
-        if (vol_z >= 2.0 and result["dia_pct"] and abs(result["dia_pct"]) >= 2
-                and "MOMENTUM" not in signals and "BREAKOUT" not in signals):
-            score += 20
+        # 5. VOL SPIKE — volumen anómalo (posible catalizador sin confirmar).
+        if vol_z >= 2.0 and result["dia_pct"] and abs(result["dia_pct"]) >= 2:
             signals.append("VOL_SPIKE")
 
-        # ── 8. CERCA DEL MÁXIMO ANUAL (resistencia → soporte potencial) ──────
-        if (result["dist52"] is not None and -5 <= result["dist52"] <= -1
-                and result["trend"] in ("↑↑↑", "↑↑", "↑")
-                and "BREAKOUT" not in signals):
-            score += 15
-            signals.append("NEAR_52W")
-
-        # ── 9. PREMARKET MOVE genérico ────────────────────────────────────────
-        if (result["pre_pct"] and abs(result["pre_pct"]) >= 1.0
-                and "GAP_RALLY" not in signals):
-            score += 12
-            signals.append("PREMARKET_MOVE")
-
         # ═════════════════════════════════════════════════════════════════════
-        # NIVELES DE ENTRADA / STOP / TARGET (basados en ATR)
+        # NIVELES SOBRE ESTRUCTURA + filtro R:R ≥ 2 (si no, se descarta el setup)
         # ═════════════════════════════════════════════════════════════════════
-        if score >= 20 and signals:
-            entry = pre_price if (pre_price and result["pre_pct"] and result["pre_pct"] > 0) else price
+        score = 0
+        if setup and entry:
+            # Stop bajo el swing low reciente; si queda demasiado ancho, 2×ATR.
+            struct_stop = swing_low - 0.15 * atr_val
+            atr_stop    = entry - 2.0 * atr_val
+            stop = (struct_stop if struct_stop < entry and (entry - struct_stop) <= 3.5 * atr_val
+                    else atr_stop)
 
-            # Stop: 1.5 ATR por debajo de entrada
-            stop    = round(entry - 1.5 * atr_val, 2)
-            # Target1: 2x ATR (R:R 1.33)
-            target1 = round(entry + 2.0 * atr_val, 2)
-            # Target2: 3.5x ATR (R:R 2.33)
-            target2 = round(entry + 3.5 * atr_val, 2)
-            rr      = round((target1 - entry) / (entry - stop), 2) if entry > stop else 0
+            # Target a la resistencia previa; si ya estamos en máximos, extensión medible.
+            target1 = resist_60 if resist_60 > entry * 1.02 else entry + 3.0 * atr_val
+            risk    = entry - stop
+            reward  = target1 - entry
+            rr      = round(reward / risk, 2) if risk > 0 else 0
+            target2 = round(entry + reward * 1.6, 2)
 
-            result["entry"]   = round(entry, 2)
-            result["stop"]    = stop
-            result["target1"] = target1
-            result["target2"] = target2
-            result["rr"]      = rr
+            if rr >= 2.0:
+                # ── Score PONDERADO (componentes con peso → rankea de verdad) ─
+                # Calidad de tendencia (0-30)
+                trend_q  = 12 if result["trend"] == "↑↑↑" else 8 if result["trend"] == "↑↑" else 4
+                trend_q += min(10, max(0, roc60 / 2.5))        # impulso a 3 meses
+                trend_q += min(8,  max(0, ema50_slope * 4))    # media subiendo
+                # Calidad de entrada (0-25): cuanto más cerca de la media ideal, mejor
+                if setup == "PULLBACK":
+                    entry_q = max(0, 25 - min(abs(dist_ema20), abs(dist_ema50)) * 4)
+                elif setup == "BREAKOUT":
+                    entry_q = 18
+                else:
+                    entry_q = 15
+                # R:R (0-20): premia el ratio por encima de 2
+                rr_q  = min(20, (rr - 2.0) * 10 + 8)
+                # Volumen relativo (0-15)
+                vol_q = min(15, max(0, vol_z * 6))
+                # RSI en la zona útil del setup (0-10)
+                center = 48 if setup == "PULLBACK" else 28 if setup == "OVERSOLD" else 58
+                rsi_q  = 10 - min(10, abs(rsi_val - center) / 2)
+
+                score = int(round(trend_q + entry_q + rr_q + vol_q + rsi_q))
+
+                result["entry"]   = round(entry, 2)
+                result["stop"]    = round(stop, 2)
+                result["target1"] = round(target1, 2)
+                result["target2"] = target2
+                result["rr"]      = rr
+            else:
+                # R:R insuficiente → no es operable; se queda solo como informativo.
+                signals = [s for s in signals if s in ("TREND", "VOL_SPIKE", "EXTENDED")]
 
         result["score"]   = min(score, 100)
         result["signals"] = signals
@@ -506,7 +562,7 @@ def trend_cell(t):
 
 with st.spinner("Analizando mercado..."):
     raw60    = fetch_ohlcv()
-    raw1y    = fetch_52w()
+    raw1y    = raw60  # mismo histórico de 1 año; se mantiene el nombre por compatibilidad
     infos    = fetch_info_all()
     news     = fetch_news_bulk()
     earnings = fetch_earnings_dates()
@@ -519,6 +575,9 @@ for t in WATCHLIST:
     r["noticia"]       = titulo
     r["sentiment"]     = sentiment_noticia(titulo)
     r["earnings_dias"] = dias_para_earnings(earnings.get(t))
+    # Aviso de catalizador: earnings dentro de 7 días → no entrar a ciegas
+    if r["earnings_dias"] is not None and r["earnings_dias"] <= 7 and r["signals"]:
+        r["signals"] = r["signals"] + ["EARNINGS"]
     results.append(r)
 
 df_all = pd.DataFrame(results)
@@ -648,10 +707,10 @@ with tab1:
         </table>
         </div>
         <div style="margin-top:8px;color:#666;font-size:0.75em">
-        Score: suma de señales ponderadas (max 100) ·
-        Entry = precio actual/premarket · Stop = Entry − 1.5×ATR14 ·
-        T1 = Entry + 2×ATR14 · T2 = Entry + 3.5×ATR14 ·
-        Vol σ = desviación estándar del volumen vs 20d
+        Score ponderado (max 100): tendencia 30 + entrada 25 + R:R 20 + volumen 15 + RSI 10 ·
+        Solo setups en tendencia validada (precio &gt; EMA50 &gt; EMA200, ROC 20/60 &gt; 0) ·
+        Stop bajo el swing low (o 2×ATR) · Target a resistencia previa ·
+        Solo se muestran setups con R:R ≥ 2:1
         </div>
         """, unsafe_allow_html=True)
 

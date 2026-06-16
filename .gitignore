@@ -1,0 +1,14 @@
+# Secretos — NUNCA subir
+.streamlit/secrets.toml
+secrets.toml
+*.env
+.env
+
+# Archivos personales/sensibles — que no salgan al repo público
+cartera_edr.py
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
