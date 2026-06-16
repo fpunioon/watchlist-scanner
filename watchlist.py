@@ -573,6 +573,14 @@ for t in WATCHLIST:
 df_all = pd.DataFrame(results)
 df_all = df_all.sort_values("score", ascending=False).reset_index(drop=True)
 
+# pandas convierte los None en NaN en columnas numéricas, y NaN es "truthy"
+# (rompe los `if row[...]` del render → muestra "$nan"). Forzamos a None real
+# en los campos opcionales (los que faltan cuando no hay setup accionable).
+for _c in ["entry", "stop", "target1", "target2", "rr", "pre_pct", "vs_pm_propio"]:
+    if _c in df_all.columns:
+        _mask = df_all[_c].notna()
+        df_all[_c] = df_all[_c].astype(object).where(_mask, None)
+
 # ── TAB layout ────────────────────────────────────────────────────────────────
 tab1, tab2, tab3 = st.tabs(["🎯 Oportunidades", "🌅 Radar Premarket", "📋 Todas las posiciones"])
 
