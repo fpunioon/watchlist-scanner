@@ -59,6 +59,7 @@ POLY_SYMBOL = {
 
 SIGNAL_LABELS = {
     "TREND":      "📈 Tendencia validada",
+    "WATCH":      "👀 En tendencia (vigilar)",
     "PULLBACK":   "🔄 Pullback en tendencia",
     "BREAKOUT":   "🚀 Breakout c/ volumen",
     "OVERSOLD":   "🏹 Rebote sobre soporte",
@@ -399,103 +400,92 @@ def analyze_ticker(ticker, raw60, raw1y, info):
         near_ema50 = -1.5 <= dist_ema50 <= 5.0
 
         # ═════════════════════════════════════════════════════════════════════
-        # MOTOR DE SEÑALES — solo setups en tendencia validada
+        # MOTOR DE SEÑALES — rankea TODA la tendencia válida (no solo el disparo)
         # ═════════════════════════════════════════════════════════════════════
 
         # Gate de tendencia REAL: precio > EMA50 > EMA200, ROC positivo a 20 y 60
-        # sesiones y media de 50 al alza. Esto descarta JNJ (ROC60 negativo) y
-        # BRK plano (slope ≈ 0). "Cerca de máximos" ya no basta.
+        # sesiones y media de 50 al alza. Descarta JNJ (ROC60 negativo) y BRK plano.
         trend_validated = (price > ema50 > ema200
                            and ema50_slope > 0
                            and roc20 > 0 and roc60 > 0)
 
         signals = []
-        setup   = None     # "PULLBACK" | "BREAKOUT" | "OVERSOLD"
+        setup   = None     # PULLBACK | BREAKOUT | OVERSOLD | WATCH | EXTENDED
         entry   = None
 
         if trend_validated:
             signals.append("TREND")
+            entry = price
 
-            # 1. PULLBACK — retroceso a EMA20/50 con RSI saliendo de zona media.
-            #    Es el setup preferente: comprar el retroceso, no la extensión.
-            if (near_ema20 or near_ema50) and 38 <= rsi_val <= 60 and rsi_val >= prev_rsi - 1:
-                setup = "PULLBACK"
+            # Clasificación del momento dentro de la tendencia:
+            if (near_ema20 or near_ema50) and 38 <= rsi_val <= 62 and rsi_val >= prev_rsi - 2:
+                setup = "PULLBACK"      # retroceso a la media → mejor entrada
                 signals.append("PULLBACK")
-                entry = price
-
-            # 2. BREAKOUT — rompiendo el máximo de 20 sesiones con volumen.
             elif price >= high20 * 0.995 and vol_z >= 1.0 and 50 <= rsi_val <= 72:
-                setup = "BREAKOUT"
+                setup = "BREAKOUT"      # rompiendo máximo de 20 sesiones con volumen
                 signals.append("BREAKOUT")
-                entry = price
-
-            # 3. EXTENDIDO — tendencia buena pero RSI vertical / lejos de la media.
-            #    Caso ASML (RSI 68 en vertical): NO se entra, solo se vigila.
-            elif rsi_val > 68 or dist_ema20 > 8:
+            elif rsi_val > 70 or dist_ema20 > 9:
+                setup = "EXTENDED"      # vertical: se vigila, NO se entra (caso ASML)
                 signals.append("EXTENDED")
+            else:
+                setup = "WATCH"         # tendencia sana esperando entrada
+                signals.append("WATCH")
 
-        # 4. OVERSOLD BOUNCE — rebote sobre soporte dentro de tendencia de fondo.
-        if (setup is None and price > ema200 and ema50_slope > -0.5
-                and rsi_val < 34 and rsi_val > prev_rsi and vol_z >= 0.8):
+        # OVERSOLD — rebote sobre soporte dentro de tendencia de fondo (sin gate alcista).
+        elif (price > ema200 and ema50_slope > -0.5
+                and rsi_val < 36 and rsi_val > prev_rsi and vol_z >= 0.5):
             setup = "OVERSOLD"
             signals.append("OVERSOLD")
             entry = price
 
-        # 5. VOL SPIKE — volumen anómalo (posible catalizador sin confirmar).
+        # VOL SPIKE — volumen anómalo (posible catalizador sin confirmar).
         if vol_z >= 2.0 and result["dia_pct"] and abs(result["dia_pct"]) >= 2:
             signals.append("VOL_SPIKE")
 
         # ═════════════════════════════════════════════════════════════════════
-        # NIVELES SOBRE ESTRUCTURA + filtro R:R ≥ 2 (si no, se descarta el setup)
+        # NIVELES + SCORE GRADUADO (puntúa todo nombre con tendencia / oversold)
         # ═════════════════════════════════════════════════════════════════════
         score = 0
         if setup and entry:
-            # Stop bajo el swing low reciente; si queda demasiado ancho, 2×ATR.
+            # Stop bajo el swing low; si queda demasiado ancho, 1.5×ATR.
             struct_stop = swing_low - 0.15 * atr_val
-            atr_stop    = entry - 2.0 * atr_val
-            stop = (struct_stop if struct_stop < entry and (entry - struct_stop) <= 3.5 * atr_val
+            atr_stop    = entry - 1.5 * atr_val
+            stop = (struct_stop if struct_stop < entry and (entry - struct_stop) <= 2.5 * atr_val
                     else atr_stop)
+            risk = max(entry - stop, atr_val * 0.5)
 
-            # Target a la resistencia previa; si ya estamos en máximos, extensión medible.
-            target1 = resist_60 if resist_60 > entry * 1.02 else entry + 3.0 * atr_val
-            risk    = entry - stop
+            # Target = extensión medible por ATR o resistencia previa, la MAYOR.
+            # (Antes usaba solo la resistencia, que en un pullback alcista queda
+            #  pegada al precio y mataba el R:R. Este es el fallo que vaciaba la lista.)
+            target1 = max(resist_60, entry + 3.0 * atr_val)
             reward  = target1 - entry
             rr      = round(reward / risk, 2) if risk > 0 else 0
             target2 = round(entry + reward * 1.6, 2)
 
-            if rr >= 2.0:
-                # ── Score PONDERADO (componentes con peso → rankea de verdad) ─
-                # Calidad de tendencia (0-30)
-                trend_q  = 12 if result["trend"] == "↑↑↑" else 8 if result["trend"] == "↑↑" else 4
-                trend_q += min(10, max(0, roc60 / 2.5))        # impulso a 3 meses
-                trend_q += min(8,  max(0, ema50_slope * 4))    # media subiendo
-                # Calidad de entrada (0-25): cuanto más cerca de la media ideal, mejor
-                if setup == "PULLBACK":
-                    entry_q = max(0, 25 - min(abs(dist_ema20), abs(dist_ema50)) * 4)
-                elif setup == "BREAKOUT":
-                    entry_q = 18
-                else:
-                    entry_q = 15
-                # R:R (0-20): premia el ratio por encima de 2
-                rr_q  = min(20, (rr - 2.0) * 10 + 8)
-                # Volumen relativo (0-15)
-                vol_q = min(15, max(0, vol_z * 6))
-                # RSI en la zona útil del setup (0-10)
-                center = 48 if setup == "PULLBACK" else 28 if setup == "OVERSOLD" else 58
-                rsi_q  = 10 - min(10, abs(rsi_val - center) / 2)
+            # ── Score ponderado (rankea de verdad) ───────────────────────────
+            trend_q  = 14 if result["trend"] == "↑↑↑" else 9 if result["trend"] == "↑↑" else 5
+            trend_q += min(10, max(0, roc60 / 2.5))        # impulso a 3 meses
+            trend_q += min(6,  max(0, ema50_slope * 3))    # media subiendo
+            prox     = min(abs(dist_ema20), abs(dist_ema50))
+            entry_q  = max(0, 25 - prox * 2.5)             # cerca de la media = mejor
+            rr_q     = min(18, max(0, (rr - 1.0) * 9))
+            vol_q    = min(12, max(0, vol_z * 5))
+            center   = 48 if setup in ("PULLBACK", "WATCH") else 28 if setup == "OVERSOLD" else 58
+            rsi_q    = 10 - min(10, abs(rsi_val - center) / 2)
+            score    = trend_q + entry_q + rr_q + vol_q + rsi_q
+            if setup == "EXTENDED":
+                score *= 0.55                              # penaliza perseguir extensión
+            score = int(round(score))
 
-                score = int(round(trend_q + entry_q + rr_q + vol_q + rsi_q))
-
+            # Niveles operativos solo si es accionable: setup real + R:R suficiente.
+            if rr >= 1.9 and setup in ("PULLBACK", "BREAKOUT", "OVERSOLD"):
                 result["entry"]   = round(entry, 2)
                 result["stop"]    = round(stop, 2)
                 result["target1"] = round(target1, 2)
                 result["target2"] = target2
                 result["rr"]      = rr
-            else:
-                # R:R insuficiente → no es operable; se queda solo como informativo.
-                signals = [s for s in signals if s in ("TREND", "VOL_SPIKE", "EXTENDED")]
 
-        result["score"]   = min(score, 100)
+        result["score"]   = min(max(score, 0), 100)
         result["signals"] = signals
 
         # ── vs PM propio ──────────────────────────────────────────────────────
